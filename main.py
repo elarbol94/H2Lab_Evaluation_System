@@ -5,7 +5,7 @@ from tkinter import messagebox
 from datetime import datetime
 
 # --- KONFIGURATION ---
-BASIS_PFAD = r"C:\Users\marty\H2Lab"
+BASIS_PFAD = r"C:\Users\aaron\Nextcloud\Documents\work\H2Lab_Evaluation_System"
 MUL_TURKIS = "#008c96" 
 
 class LaborApp(ctk.CTk):

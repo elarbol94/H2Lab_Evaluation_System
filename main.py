@@ -1,5 +1,8 @@
 import customtkinter as ctk
 import os
+import sys
+import subprocess
+import threading
 import json
 import sqlite3
 import urllib.request
@@ -13,6 +16,23 @@ from datetime import datetime
 BASIS_PFAD = r"C:\Users\aaron\Nextcloud\Documents\work\H2Lab_Evaluation_System"
 MUL_TURKIS = "#008c96"
 MUL_DUNKEL = "#0a2a2d"
+
+# Pfad zu EMI_calculation.py (die echte Berechnung von raw_data zu processed_data,
+# via HSMTools). Wird als eigener Subprozess gestartet, NICHT im main.py-Prozess
+# importiert - so bleibt die GUI responsiv und fehlende Pakete/Abstürze im
+# Berechnungs-Skript reißen die App nicht mit runter.
+# Wenn None, wird automatisch gesucht:
+#   1) neben dieser main.py
+#   2) unter <main.py-Ordner>/EMI/data_preparation/EMI_calculation.py
+# Falls das Skript wo ganz anders liegt, hier den vollen Pfad eintragen, z.B.:
+# EMI_CALCULATION_SCRIPT_PFAD = r"C:\Users\aaron\...\EMI\data_preparation\EMI_calculation.py"
+EMI_CALCULATION_SCRIPT_PFAD = None
+
+# Optional: anderer Python-Interpreter für die EMI-Berechnung (falls HSMTools
+# in einer eigenen venv installiert ist, nicht in der venv der GUI-App).
+# Kann alternativ auch als Umgebungsvariable HSMTOOLS_PYTHON gesetzt werden.
+# Beispiel: r"C:\Users\aaron\hsmtools_venv\Scripts\python.exe"
+HSMTOOLS_PYTHON_PFAD = None
 
 # --- GOOGLE SHEET (Projekt-Übersicht) ---
 # Jeder Tab (Arbeitsblatt) im Spreadsheet entspricht einem Projekt.
@@ -43,6 +63,13 @@ class LaborApp(ctk.CTk):
         self.title("MUL - H2Lab Staub-System")
         self.geometry("600x800")
         ctk.set_appearance_mode("System")
+
+        # Bekanntes CustomTkinter-Problem: die interne DPI-Scaling-Prüfschleife
+        # (check_dpi_scaling / update, per self.after() geplant) läuft weiter,
+        # auch nachdem das Fenster mit dem X geschlossen wurde -> danach
+        # "invalid command name ... (after script)" im Terminal. Fix laut
+        # CustomTkinter-Doku: beim Schließen ZUERST quit(), DANN destroy().
+        self.protocol("WM_DELETE_WINDOW", self.beim_schliessen)
 
         self.aktuelle_sheet_daten = None  # Zeilen aus dem Datenblatt des aktuell gewählten Projekts
         self.ergebnisse_cache = {}  # {Methode: (header, gefilterte_zeilen)} - vorberechnet pro Projektwechsel
@@ -78,11 +105,28 @@ class LaborApp(ctk.CTk):
             self.on_projekt_wechsel(erstes_projekt)
 
     # ------------------------------------------------------------------
+    # SAUBERES BEENDEN
+    # ------------------------------------------------------------------
+    def beim_schliessen(self):
+        """
+        Wird bei Klick auf das X des Hauptfensters aufgerufen statt direkt
+        destroy(). quit() beendet zuerst die Tkinter-Mainloop sauber, DANACH
+        erst destroy() - verhindert das bekannte CustomTkinter-Nachlauf-
+        Problem, bei dem intern noch geplante after()-Aufrufe (DPI-Scaling-
+        Check etc.) nach dem Zerstören des Fensters "invalid command name"
+        ins Terminal werfen.
+        """
+        try:
+            self.quit()
+        finally:
+            self.destroy()
+
+    # ------------------------------------------------------------------
     # GOOGLE SHEET (Projektliste)
     # ------------------------------------------------------------------
     def _status(self, text, farbe="white"):
         """Setzt die Statuszeile, falls sie bereits existiert (defensiv, s. __init__-Reihenfolge)."""
-        if hasattr(self, "status_label"):
+        if hasattr(self, "status_label") and self.status_label.winfo_exists():
             self.status_label.configure(text=text, text_color=farbe)
 
     def hole_projekte_aus_spreadsheet(self):
@@ -462,17 +506,31 @@ class LaborApp(ctk.CTk):
     def oeffne_methoden_detail(self, projekt, methode):
         top = ctk.CTkToplevel(self)
         top.title(f"{projekt} – {methode}")
-        top.geometry("680x620")
+
+        # Fenster an die Bildschirmgröße anpassen (statt fixer 680x620), damit die
+        # Tabellen (Metadaten/Rohdaten/Ergebnisse) genug Platz haben und Werte
+        # nicht abgeschnitten werden. Zusätzlich frei größenverstellbar.
+        bildschirm_breite = top.winfo_screenwidth()
+        bildschirm_hoehe = top.winfo_screenheight()
+        breite = min(int(bildschirm_breite * 0.85), 1400)
+        hoehe = min(int(bildschirm_hoehe * 0.85), 950)
+        x = (bildschirm_breite - breite) // 2
+        y = (bildschirm_hoehe - hoehe) // 2
+        top.geometry(f"{breite}x{hoehe}+{x}+{y}")
+        top.minsize(900, 600)
+        top.resizable(True, True)
 
         ctk.CTkLabel(top, text=f"{methode} – {projekt}", font=("Arial", 16, "bold")).pack(pady=(15, 10))
 
-        tabs = ctk.CTkTabview(top, width=650, height=540)
+        tabs = ctk.CTkTabview(top)
         tabs.pack(padx=10, pady=(0, 10), fill="both", expand=True)
         tab_metadaten = tabs.add("Metadaten")
         tab_rohdaten = tabs.add("Rohdaten")
+        tab_ergebnisse = tabs.add("Ergebnisse")
 
         self.baue_metadaten_tab(tab_metadaten, projekt, methode)
         self.baue_rohdaten_tab(tab_rohdaten, projekt, methode)
+        self.baue_ergebnisse_tab(tab_ergebnisse, projekt, methode)
 
     # ------------------------------------------------------------------
     # .dat-AUSWERTUNG (Erhitzungsmikroskop-Datenbank pro Versuch)
@@ -538,54 +596,255 @@ class LaborApp(ctk.CTk):
     # ------------------------------------------------------------------
     # PROCESSED_DATA / "Berechnen"
     # ------------------------------------------------------------------
+    def processed_data_ordner_fuer(self, raw_data_ordner):
+        """Spiegelt einen raw_data-Ordner nach processed_data (…/data/raw_data -> …/data/processed_data)."""
+        processed_ordner = raw_data_ordner.replace(
+            os.sep + "raw_data", os.sep + "processed_data"
+        )
+        if processed_ordner == raw_data_ordner:  # falls "raw_data" nicht exakt im Pfad vorkam
+            processed_ordner = os.path.join(os.path.dirname(raw_data_ordner), "processed_data")
+        return processed_ordner
+
     def processed_data_pfad_fuer(self, raw_data_ordner, eintrag):
         """
         Spiegelt den Pfad eines raw_data-Eintrags (Datei oder Ordner) nach
         processed_data (…/data/raw_data/X -> …/data/processed_data/X).
         Erzeugt NICHTS - reine Pfad-Berechnung für den Existenz-Check.
         """
-        processed_ordner = raw_data_ordner.replace(
-            os.sep + "raw_data", os.sep + "processed_data"
-        )
-        if processed_ordner == raw_data_ordner:  # falls "raw_data" nicht exakt im Pfad vorkam
-            processed_ordner = os.path.join(os.path.dirname(raw_data_ordner), "processed_data")
-        return os.path.join(processed_ordner, eintrag)
+        return os.path.join(self.processed_data_ordner_fuer(raw_data_ordner), eintrag)
 
-    def ist_versuch_verarbeitet(self, raw_data_ordner, eintrag):
+    def _sanitiere_versuchsnamen(self, name):
+        """Muss ident zu _sanitize_name() in EMI_calculation.py sein, damit wir
+        denselben Ausgabe-Dateinamen vorhersagen können (Leerzeichen -> _)."""
+        return str(name or "").strip().replace(" ", "_")
+
+    def ist_versuch_verarbeitet(self, raw_data_ordner, eintrag, methode=None):
         """
-        Prüft NUR, ob unter processed_data bereits etwas mit demselben Namen
-        wie der raw_data-Eintrag existiert (Datei oder Ordner) - es wird
-        nichts berechnet oder erzeugt. Die eigentliche Berechnung/Auswertung
-        liefert später ein separates Script (kommt noch von Aaron).
+        Prüft, ob ein Versuch bereits verarbeitet wurde.
+        Bei EMI: sucht die von EMI_calculation.py erzeugte
+        "<sanitierter_name>_results.parquet"-Datei in processed_data.
+        Bei anderen Methoden (noch kein Berechnungs-Skript vorhanden):
+        Platzhalter-Check, ob irgendwas mit demselben Namen existiert.
         """
-        ziel = self.processed_data_pfad_fuer(raw_data_ordner, eintrag)
+        processed_ordner = self.processed_data_ordner_fuer(raw_data_ordner)
+        if methode == "EMI":
+            versuch_name = os.path.splitext(eintrag)[0]
+            ziel = os.path.join(processed_ordner, f"{self._sanitiere_versuchsnamen(versuch_name)}_results.parquet")
+        else:
+            ziel = os.path.join(processed_ordner, eintrag)
         return os.path.exists(ziel)
+
+    # ------------------------------------------------------------------
+    # EMI-Berechnung (echtes Skript: EMI_calculation.py / HSMTools)
+    # Läuft bewusst NICHT im main.py-Prozess: wird als eigener Python-
+    # Subprozess gestartet (wie in der .md als CLI-Aufruf beschrieben), in
+    # einem Hintergrund-Thread, damit die GUI währenddessen nicht einfriert
+    # und Abstürze/fehlende Pakete im Berechnungs-Skript die App nicht
+    # mitreißen.
+    # ------------------------------------------------------------------
+    def finde_emi_calculation_skript(self):
+        """
+        Sucht EMI_calculation.py in dieser Reihenfolge:
+          1) EMI_CALCULATION_SCRIPT_PFAD (falls gesetzt)
+          2) neben main.py
+          3) <main.py-Ordner>/EMI/data_preparation/EMI_calculation.py
+        Gibt den Pfad zurück oder wirft FileNotFoundError.
+        """
+        skript_ordner = os.path.dirname(os.path.abspath(__file__))
+        kandidaten = []
+        if EMI_CALCULATION_SCRIPT_PFAD:
+            kandidaten.append(EMI_CALCULATION_SCRIPT_PFAD)
+        kandidaten.append(os.path.join(skript_ordner, "EMI_calculation.py"))
+        kandidaten.append(os.path.join(skript_ordner, "EMI", "data_preparation", "EMI_calculation.py"))
+
+        gefundener_pfad = next((p for p in kandidaten if p and os.path.isfile(p)), None)
+        if not gefundener_pfad:
+            raise FileNotFoundError(
+                "EMI_calculation.py nicht gefunden. Gesucht an:\n"
+                + "\n".join(kandidaten)
+                + "\n\nEntweder das Skript dort ablegen oder EMI_CALCULATION_SCRIPT_PFAD "
+                "am Kopf von main.py auf den vollen Pfad setzen."
+            )
+        return gefundener_pfad
+
+    def fuehre_emi_berechnung_aus(self, unverarbeitete_versuche, log_zeile_callback):
+        """
+        Startet EMI_calculation.py als eigenen Python-Subprozess (CLI, wie in
+        der .md dokumentiert) - NICHT im main.py-Prozess. Läuft in DIESEM
+        Aufruf synchron (blockierend), wird daher von starte_berechnung()
+        immer in einem Hintergrund-Thread aufgerufen, nie direkt im GUI-Thread.
+        Ruft NUR für die übergebenen, noch unverarbeiteten Versuche auf
+        (--samples, kein --force) - bestehende processed_data-Dateien
+        anderer Versuche bleiben unangetastet. Gruppiert nach raw_data-
+        Ordner, da das Skript einen ganzen Ordner voller Sample-Unterordner
+        pro Aufruf erwartet.
+
+        log_zeile_callback(text) wird für JEDE Ausgabezeile des Subprozesses
+        sofort aufgerufen (live), damit man im UI sieht, dass/was gerade
+        passiert - statt stumm auf das Ende zu warten.
+
+        Gibt None bei Erfolg zurück, sonst einen Fehlertext.
+        """
+        try:
+            skript_pfad = self.finde_emi_calculation_skript()
+        except Exception as e:
+            return str(e)
+
+        python_interpreter = os.environ.get("HSMTOOLS_PYTHON") or HSMTOOLS_PYTHON_PFAD or sys.executable
+
+        gruppen = {}
+        for staub, eintrag, voller_pfad in unverarbeitete_versuche:
+            raw_data_ordner = os.path.dirname(voller_pfad)
+            gruppen.setdefault(raw_data_ordner, []).append(eintrag)
+
+        for raw_data_ordner, sample_namen in gruppen.items():
+            output_ordner = self.processed_data_ordner_fuer(raw_data_ordner)
+            os.makedirs(output_ordner, exist_ok=True)
+
+            befehl = [
+                python_interpreter,
+                "-u",  # unbuffered stdout -> print()-Zeilen kommen sofort an, nicht erst am Ende gebündelt
+                skript_pfad,
+                "--input-dir", raw_data_ordner,
+                "--output-dir", output_ordner,
+                "--samples", *sample_namen,
+            ]
+            log_zeile_callback(f"$ {' '.join(befehl)}")
+
+            try:
+                prozess = subprocess.Popen(
+                    befehl,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # beides zusammen -> eine Zeitleiste, nichts geht verloren
+                    text=True,
+                    bufsize=1,  # Zeilenweise gepuffert -> Zeilen kommen live an, nicht erst am Ende
+                )
+            except Exception as e:
+                return f"Konnte EMI_calculation.py nicht starten ('{raw_data_ordner}'):\n{e}"
+
+            gesammelte_ausgabe = []
+            for zeile in prozess.stdout:
+                zeile = zeile.rstrip("\n")
+                gesammelte_ausgabe.append(zeile)
+                log_zeile_callback(zeile)
+
+            returncode = prozess.wait(timeout=3600)
+            if returncode != 0:
+                ausgabe = "\n".join(gesammelte_ausgabe[-40:]) or "(keine Ausgabe)"
+                return f"EMI_calculation.py meldete einen Fehler (Exit-Code {returncode}) in '{raw_data_ordner}':\n\n{ausgabe}"
+
+        return None
+
+    def oeffne_berechnungs_log_fenster(self, titel):
+        """Öffnet ein kleines Fenster mit Live-Log-Textbox für die laufende Berechnung."""
+        log_fenster = ctk.CTkToplevel(self)
+        log_fenster.title(titel)
+        log_fenster.geometry("760x480")
+        log_fenster.attributes("-topmost", True)
+
+        ctk.CTkLabel(
+            log_fenster, text=titel, font=("Arial", 14, "bold")
+        ).pack(pady=(10, 5))
+
+        log_textbox = ctk.CTkTextbox(log_fenster, width=730, height=400, font=("Consolas", 11))
+        log_textbox.pack(padx=10, pady=(0, 10), fill="both", expand=True)
+        log_textbox.configure(state="disabled")
+
+        return log_fenster, log_textbox
 
     def starte_berechnung(self, projekt, methode, rohdaten_frame):
         """
-        'Berechnen'-Button (Platzhalter-Stand): geht jeden raw_data-Eintrag
-        der Methode durch und prüft nur, ob er bereits in processed_data
-        liegt - erzeugt/berechnet aktuell nichts. Baut danach die
-        Rohdaten-Liste neu auf, damit die Häkchen den aktuellen Stand zeigen.
+        'Berechnen'-Button. Bei EMI: startet die echte Berechnung
+        (EMI_calculation.py/HSMTools) als eigenen Subprozess in einem
+        Hintergrund-Thread, mit Live-Log-Fenster - die GUI bleibt
+        währenddessen bedienbar und man SIEHT, dass/was gerade passiert.
+        Bei anderen Methoden (noch kein Skript vorhanden): reiner
+        Platzhalter-Check wie bisher.
         """
         versuche = self.liste_versuche(projekt, methode)
         anzahl_gesamt = len(versuche)
-        anzahl_verarbeitet = 0
 
-        for staub, eintrag, voller_pfad in versuche:
-            raw_data_ordner = os.path.dirname(voller_pfad)
-            if self.ist_versuch_verarbeitet(raw_data_ordner, eintrag):
-                anzahl_verarbeitet += 1
+        unverarbeitete = [
+            (staub, eintrag, voller_pfad)
+            for staub, eintrag, voller_pfad in versuche
+            if not self.ist_versuch_verarbeitet(os.path.dirname(voller_pfad), eintrag, methode)
+        ]
 
-        self._status(
-            f"Geprüft: {anzahl_verarbeitet}/{anzahl_gesamt} Versuche bereits in processed_data.",
-            "#00ff88",
+        if methode != "EMI":
+            anzahl_verarbeitet = anzahl_gesamt - len(unverarbeitete)
+            self._status(
+                f"Geprüft: {anzahl_verarbeitet}/{anzahl_gesamt} Versuche bereits in processed_data.",
+                "#00ff88",
+            )
+            for widget in rohdaten_frame.winfo_children():
+                widget.destroy()
+            self.baue_rohdaten_tab(rohdaten_frame, projekt, methode)
+            return
+
+        if not unverarbeitete:
+            self._status("Alle EMI-Versuche bereits in processed_data vorhanden.", "#00ff88")
+            for widget in rohdaten_frame.winfo_children():
+                widget.destroy()
+            self.baue_rohdaten_tab(rohdaten_frame, projekt, methode)
+            return
+
+        self._status(f"Berechne {len(unverarbeitete)} EMI-Versuch(e) im Hintergrund ...", "#ffff00")
+        log_fenster, log_textbox = self.oeffne_berechnungs_log_fenster(
+            f"EMI-Berechnung läuft: {projekt} ({len(unverarbeitete)} Versuch(e))"
         )
 
-        # Rohdaten-Liste neu aufbauen, damit die Häkchen aktuell sind
-        for widget in rohdaten_frame.winfo_children():
-            widget.destroy()
-        self.baue_rohdaten_tab(rohdaten_frame, projekt, methode)
+        def log_anhaengen(text):
+            # Fenster/Textbox kann inzwischen geschlossen worden sein (User hat
+            # das Log-Fenster zugemacht, während die Berechnung im Hintergrund
+            # noch läuft) - dann NICHT mehr versuchen, sie zu beschreiben,
+            # sonst TclError "invalid command name ...". Die Berechnung selbst
+            # (Subprozess) läuft davon unbeeindruckt im Hintergrund weiter.
+            if not log_textbox.winfo_exists():
+                return
+            try:
+                log_textbox.configure(state="normal")
+                log_textbox.insert("end", text + "\n")
+                log_textbox.see("end")
+                log_textbox.configure(state="disabled")
+            except Exception:
+                pass
+
+        def hintergrund_arbeit():
+            def live_zeile(zeile):
+                # Kommt aus dem Hintergrund-Thread -> Textbox-Update in den GUI-Thread verlagern.
+                self.after(0, lambda z=zeile: log_anhaengen(z))
+
+            fehler = self.fuehre_emi_berechnung_aus(unverarbeitete, live_zeile)
+            self.after(0, lambda: fertig_im_gui_thread(fehler))
+
+        def fertig_im_gui_thread(fehler):
+            if fehler:
+                log_anhaengen(f"\n--- FEHLER ---\n{fehler}")
+                messagebox.showerror("EMI-Berechnung fehlgeschlagen", fehler)
+                self._status("EMI-Berechnung fehlgeschlagen (siehe Fehlermeldung/Log).", "#ff5555")
+            else:
+                jetzt_verarbeitet = anzahl_gesamt - sum(
+                    1 for _s, e, p in versuche
+                    if not self.ist_versuch_verarbeitet(os.path.dirname(p), e, methode)
+                )
+                log_anhaengen(f"\n--- FERTIG ({jetzt_verarbeitet}/{anzahl_gesamt} verarbeitet) ---")
+                self._status(
+                    f"EMI-Berechnung abgeschlossen ({jetzt_verarbeitet}/{anzahl_gesamt} verarbeitet).",
+                    "#00ff88",
+                )
+            # Auch hier: Log-Fenster und Rohdaten-Frame können vom User
+            # inzwischen geschlossen worden sein -> vor jedem Zugriff prüfen.
+            if log_fenster.winfo_exists():
+                try:
+                    log_fenster.attributes("-topmost", False)
+                except Exception:
+                    pass
+            if rohdaten_frame.winfo_exists():
+                for widget in rohdaten_frame.winfo_children():
+                    widget.destroy()
+                self.baue_rohdaten_tab(rohdaten_frame, projekt, methode)
+
+        threading.Thread(target=hintergrund_arbeit, daemon=True).start()
 
     # ------------------------------------------------------------------
     # TAB: METADATEN (vormals "Ergebnisse")
@@ -605,48 +864,47 @@ class LaborApp(ctk.CTk):
             ctk.CTkLabel(parent, text="Keine Versuche in raw_data gefunden.").pack(pady=20)
             return
 
-        scroll = ctk.CTkScrollableFrame(parent, width=620, height=500)
+        scroll = ctk.CTkScrollableFrame(parent, width=1100, height=750)
         scroll.pack(padx=5, pady=5, fill="both", expand=True)
 
-        for staub, eintrag, voller_pfad in versuche:
+        if methode == "EMI":
+            spalten = ["Versuch", "Material", "Kommentar (Lime addition)", "Temperaturverlauf", "Gas", "Durchfluss"]
+        else:
+            spalten = ["Versuch", "Info"]
+
+        # Spalten gleichmäßig über die volle (jetzt größere) Fensterbreite verteilen
+        for spalte_index in range(len(spalten)):
+            scroll.grid_columnconfigure(spalte_index, weight=1, minsize=140)
+
+        for spalte_index, titel in enumerate(spalten):
+            ctk.CTkLabel(
+                scroll, text=titel, font=("Arial", 12, "bold"),
+            ).grid(row=0, column=spalte_index, padx=10, pady=(0, 10), sticky="w")
+
+        for zeilen_index, (staub, eintrag, voller_pfad) in enumerate(versuche, start=1):
             versuch_name = os.path.splitext(eintrag)[0]
-
-            karte = ctk.CTkFrame(scroll, fg_color=("gray85", "gray20"))
-            karte.pack(fill="x", pady=5, padx=2)
-
-            ctk.CTkLabel(karte, text=versuch_name, font=("Arial", 12, "bold")).pack(anchor="w", padx=10, pady=(6, 2))
 
             if methode == "EMI":
                 emi_parameter = self.hole_emi_parameter_fuer_versuch(versuch_name)
                 if emi_parameter:
-                    ctk.CTkLabel(
-                        karte,
-                        text=(
-                            f"Material: {emi_parameter['material'] or '-'}   "
-                            f"Kommentar (Lime addition): {emi_parameter['kommentar'] or '-'}"
-                        ),
-                        anchor="w", font=("Arial", 10), wraplength=580,
-                    ).pack(anchor="w", padx=10, pady=(0, 2))
-                    ctk.CTkLabel(
-                        karte,
-                        text=(
-                            f"Temperaturverlauf: {emi_parameter['temperaturverlauf'] or '-'}   "
-                            f"Gas: {emi_parameter['gas'] or '-'}   "
-                            f"Durchfluss: {emi_parameter['durchfluss'] or '-'}"
-                        ),
-                        anchor="w", font=("Arial", 10), wraplength=580,
-                    ).pack(anchor="w", padx=10, pady=(0, 8))
+                    werte = [
+                        versuch_name,
+                        emi_parameter["material"],
+                        emi_parameter["kommentar"],
+                        emi_parameter["temperaturverlauf"],
+                        emi_parameter["gas"],
+                        emi_parameter["durchfluss"],
+                    ]
                 else:
-                    ctk.CTkLabel(
-                        karte,
-                        text="Noch keine Zeile mit passender 'Messung'-ID im Sheet gefunden.",
-                        anchor="w", font=("Arial", 10), text_color=("gray40", "gray70"),
-                    ).pack(anchor="w", padx=10, pady=(0, 8))
+                    werte = [versuch_name, "Noch keine passende Zeile im Sheet gefunden.", "", "", "", ""]
             else:
+                werte = [versuch_name, "Für diese Methode noch keine Sheet-Anbindung."]
+
+            for spalte_index, wert in enumerate(werte):
                 ctk.CTkLabel(
-                    karte, text="Für diese Methode noch keine Sheet-Anbindung.",
-                    anchor="w", font=("Arial", 10), text_color=("gray40", "gray70"),
-                ).pack(anchor="w", padx=10, pady=(0, 8))
+                    scroll, text=str(wert or "-"), font=("Arial", 11),
+                    anchor="w", justify="left", wraplength=220,
+                ).grid(row=zeilen_index, column=spalte_index, padx=10, pady=5, sticky="w")
 
     # ------------------------------------------------------------------
     # TAB: ROHDATEN
@@ -660,7 +918,25 @@ class LaborApp(ctk.CTk):
             ctk.CTkLabel(parent, text="Keine lokalen Rohdaten gefunden.").pack(pady=20)
             return
 
-        scroll = ctk.CTkScrollableFrame(parent, width=610, height=440)
+        kopfzeile = ctk.CTkFrame(parent, fg_color="transparent")
+        kopfzeile.pack(fill="x", padx=5, pady=(5, 0))
+        ctk.CTkLabel(kopfzeile, text="Versuche", font=("Arial", 12, "bold")).pack(side="left", padx=5)
+        ctk.CTkLabel(kopfzeile, text="Processed", font=("Arial", 12, "bold")).pack(side="right", padx=20)
+
+        # Button-Leiste ZUERST mit side="bottom" packen, damit ihr Platz fest
+        # reserviert ist, BEVOR die (ggf. große) Scrollbar-Fläche gepackt wird -
+        # sonst kann eine hohe height=... im CTkScrollableFrame den Button
+        # nach unten aus dem sichtbaren Bereich drücken.
+        button_zeile = ctk.CTkFrame(parent, fg_color="transparent")
+        button_zeile.pack(side="bottom", fill="x", padx=5, pady=8)
+        ctk.CTkButton(
+            button_zeile,
+            text="Berechnen",
+            fg_color=MUL_TURKIS,
+            command=lambda: self.starte_berechnung(projekt, methode, parent),
+        ).pack(side="right")
+
+        scroll = ctk.CTkScrollableFrame(parent, width=1100, height=650)
         scroll.pack(padx=5, pady=(5, 0), fill="both", expand=True)
 
         for staub, eintrag, voller_pfad in versuche:
@@ -670,15 +946,156 @@ class LaborApp(ctk.CTk):
             ctk.CTkLabel(zeile, text=f"{symbol} [{staub}] {eintrag}", anchor="w").pack(
                 side="left", padx=5
             )
+            verarbeitet = self.ist_versuch_verarbeitet(os.path.dirname(voller_pfad), eintrag, methode)
+            ctk.CTkLabel(
+                zeile,
+                text="✓" if verarbeitet else "",
+                font=("Arial", 14, "bold"),
+                text_color="#00ff88",
+                width=80,
+                anchor="e",
+            ).pack(side="right", padx=20)
 
-        button_zeile = ctk.CTkFrame(parent, fg_color="transparent")
-        button_zeile.pack(fill="x", padx=5, pady=8)
-        ctk.CTkButton(
-            button_zeile,
-            text="Berechnen",
-            fg_color=MUL_TURKIS,
-            command=lambda: self.starte_berechnung(projekt, methode, parent),
-        ).pack(side="right")
+    # ------------------------------------------------------------------
+    # TAB: ERGEBNISSE (Höhenverlauf + Form pro Versuch, aus processed_data)
+    # ------------------------------------------------------------------
+    def baue_ergebnisse_tab(self, parent, projekt, methode):
+        """
+        Zeigt pro (bereits verarbeitetem) Versuch den Höhenverlauf
+        (sample_height_px über Temperature) und die Form/Kontur
+        (contour_x/contour_y) aus der zugehörigen <versuch>_results.parquet-
+        Datei. Jeder Versuch hat seine eigene Form, daher Auswahl per Dropdown.
+        """
+        if methode != "EMI":
+            ctk.CTkLabel(
+                parent, text="Ergebnisdarstellung ist aktuell nur für EMI verfügbar."
+            ).pack(pady=20)
+            return
+
+        versuche = self.liste_versuche(projekt, methode)
+        verarbeitete_versuche = [
+            (staub, eintrag, voller_pfad)
+            for staub, eintrag, voller_pfad in versuche
+            if self.ist_versuch_verarbeitet(os.path.dirname(voller_pfad), eintrag, methode)
+        ]
+
+        if not verarbeitete_versuche:
+            ctk.CTkLabel(
+                parent, text="Noch keine verarbeiteten Versuche (siehe Rohdaten-Tab -> Berechnen)."
+            ).pack(pady=20)
+            return
+
+        auswahl_zeile = ctk.CTkFrame(parent, fg_color="transparent")
+        auswahl_zeile.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(auswahl_zeile, text="Versuch:", font=("Arial", 12, "bold")).pack(
+            side="left", padx=(0, 10)
+        )
+
+        plot_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        plot_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        versuch_namen = [os.path.splitext(eintrag)[0] for _s, eintrag, _p in verarbeitete_versuche]
+
+        def zeige_versuch(versuch_name):
+            for widget in plot_frame.winfo_children():
+                widget.destroy()
+            eintrag_info = next(
+                (s, e, p) for s, e, p in verarbeitete_versuche
+                if os.path.splitext(e)[0] == versuch_name
+            )
+            self.rendere_ergebnis_plot(plot_frame, eintrag_info)
+
+        dropdown = ctk.CTkOptionMenu(
+            auswahl_zeile, values=versuch_namen, command=zeige_versuch, fg_color=MUL_TURKIS,
+        )
+        dropdown.pack(side="left")
+
+        zeige_versuch(versuch_namen[0])
+
+    def lade_ergebnis_dataframe(self, eintrag, voller_pfad):
+        """Lädt <versuch>_results.parquet aus processed_data als pandas DataFrame, oder None."""
+        raw_data_ordner = os.path.dirname(voller_pfad)
+        processed_ordner = self.processed_data_ordner_fuer(raw_data_ordner)
+        versuch_name = os.path.splitext(eintrag)[0]
+        parquet_pfad = os.path.join(
+            processed_ordner, f"{self._sanitiere_versuchsnamen(versuch_name)}_results.parquet"
+        )
+        if not os.path.exists(parquet_pfad):
+            return None
+        try:
+            import polars as pl
+            return pl.read_parquet(parquet_pfad).to_pandas()
+        except ImportError:
+            try:
+                import pandas as pd
+                return pd.read_parquet(parquet_pfad)
+            except Exception as e:
+                print(f"[Ergebnis-Parquet Fehler] {parquet_pfad}: {e}")
+                return None
+        except Exception as e:
+            print(f"[Ergebnis-Parquet Fehler] {parquet_pfad}: {e}")
+            return None
+
+    def rendere_ergebnis_plot(self, parent, eintrag_info):
+        """Zeichnet Höhenverlauf (links) und letzte gültige Form/Kontur (rechts) für einen Versuch."""
+        staub, eintrag, voller_pfad = eintrag_info
+        df = self.lade_ergebnis_dataframe(eintrag, voller_pfad)
+
+        if df is None or df.empty:
+            ctk.CTkLabel(
+                parent, text="Konnte processed_data nicht laden (siehe Konsole für Details)."
+            ).pack(pady=20)
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        except ImportError:
+            ctk.CTkLabel(
+                parent,
+                text="matplotlib ist nicht installiert - 'pip install matplotlib' im GUI-Environment nötig.",
+                wraplength=560,
+            ).pack(pady=20)
+            return
+
+        fig, (ax_hoehe, ax_form) = plt.subplots(1, 2, figsize=(9, 4.2))
+
+        # --- Höhenverlauf ---
+        if "Temperature" in df.columns and "sample_height_px" in df.columns:
+            gueltig = df.dropna(subset=["sample_height_px"]).sort_values("Temperature")
+            if not gueltig.empty:
+                referenz_hoehe = gueltig["sample_height_px"].iloc[0]
+                if referenz_hoehe:
+                    hoehe_rel_pct = gueltig["sample_height_px"] / referenz_hoehe * 100
+                    ax_hoehe.plot(gueltig["Temperature"], hoehe_rel_pct, color=MUL_TURKIS, linewidth=2)
+        ax_hoehe.set_xlabel("Temperature [°C]")
+        ax_hoehe.set_ylabel("Sample Height [% of initial]")
+        ax_hoehe.set_title("Höhenverlauf")
+        ax_hoehe.grid(True, alpha=0.3)
+
+        # --- Form / Kontur (letzte gültige, meist bei höchster Temperatur) ---
+        letzte_kontur = None
+        if "contour_x" in df.columns and "contour_y" in df.columns:
+            for _, zeile in df.iloc[::-1].iterrows():
+                cx, cy = zeile.get("contour_x"), zeile.get("contour_y")
+                if cx is not None and cy is not None and len(cx) > 0:
+                    letzte_kontur = (cx, cy)
+                    break
+        if letzte_kontur:
+            cx, cy = letzte_kontur
+            ax_form.plot(cx, cy, color=MUL_DUNKEL, linewidth=2)
+            ax_form.invert_yaxis()
+            ax_form.set_aspect("equal", adjustable="box")
+        ax_form.set_xlabel("x [px]")
+        ax_form.set_ylabel("y [px]")
+        ax_form.set_title("Form (letzte gültige Kontur)")
+        ax_form.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
 
     # ------------------------------------------------------------------
     # HILFSFUNKTIONEN (Ordnerstruktur)

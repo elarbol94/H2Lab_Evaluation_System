@@ -1120,10 +1120,21 @@ class LaborApp(ctk.CTk):
         plot_frame = ctk.CTkFrame(haupt_layout, fg_color="transparent")
         plot_frame.pack(side="left", fill="both", expand=True)
 
+        # Kleine Button-Leiste OBERHALB der Diagramme (nicht über die
+        # Zeichenfläche gelegt - MUSS vor dem Canvas gepackt werden, damit
+        # sie garantiert sichtbar oberhalb bleibt statt vom Canvas
+        # überdeckt/verdrängt zu werden). Zwei gleich breite Spalten, damit
+        # der linke Button über dem linken und der rechte über dem rechten
+        # Diagramm landet.
+        button_leiste = ctk.CTkFrame(plot_frame, fg_color="transparent")
+        button_leiste.pack(side="top", fill="x")
+        button_leiste.grid_columnconfigure(0, weight=1)
+        button_leiste.grid_columnconfigure(1, weight=1)
+
         # Figure/Canvas EINMAL erzeugen (siehe Docstring oben)
         fig, (ax_hoehe, ax_form) = plt.subplots(1, 2, figsize=(10, 4.6))
         canvas = FigureCanvasTkAgg(fig, master=plot_frame)
-        canvas.get_tk_widget().pack(fill="both", expand=True)
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
 
         cmap = plt.get_cmap("jet")
         vmin_start, vmax_start = farbskala_grenzen()
@@ -1139,6 +1150,10 @@ class LaborApp(ctk.CTk):
                 (s, e, p) for s, e, p in verarbeitete_versuche
                 if os.path.splitext(e)[0] == versuch_name
             )
+            # Für den Download-Button gemerkt: der tatsächliche raw_data-
+            # Ordner dieses Versuchs, um daraus den Ausgabe-Ordner zu
+            # spiegeln (siehe diagramm_ordner_fuer).
+            zustand["_aktueller_raw_data_ordner"] = os.path.dirname(eintrag_info[2])
             # Farbskala VOR dem Zeichnen aktualisieren, falls sich x_min/x_max
             # links oder eine explizite Farbskala-Einstellung geändert haben.
             vmin, vmax = farbskala_grenzen()
@@ -1147,6 +1162,56 @@ class LaborApp(ctk.CTk):
             self.zeichne_ergebnis_plot(
                 eintrag_info, fig, ax_hoehe, ax_form, canvas, sm, farbskala, zustand, np, mcolors
             )
+
+        def speichere_diagrammausschnitt(ax, dateiname_teil):
+            """
+            Speichert NUR den Bereich von ax (also entweder Höhenverlauf oder
+            Schmelzverlauf, nicht beide zusammen) als PNG, gespiegelt vom
+            raw_data-Ordner des aktuellen Versuchs nach outputs/diagramm
+            (siehe diagramm_ordner_fuer - wird bei Bedarf angelegt).
+            """
+            versuch_name = zustand["versuch_name"]
+            raw_data_ordner = zustand.get("_aktueller_raw_data_ordner")
+            if not versuch_name or not raw_data_ordner:
+                return
+            try:
+                ziel_ordner = self.diagramm_ordner_fuer(raw_data_ordner)
+                zeitstempel = datetime.now().strftime("%Y%m%d_%H%M%S")
+                dateiname = f"{self._sanitiere_versuchsnamen(versuch_name)}_{dateiname_teil}_{zeitstempel}.png"
+                ziel_pfad = os.path.join(ziel_ordner, dateiname)
+                # Nur die Bounding-Box der jeweiligen Achse exportieren (inkl.
+                # Titel/Beschriftung), nicht die ganze Figure mit beiden Plots.
+                canvas.draw()
+                bbox = ax.get_tightbbox(canvas.get_renderer()).transformed(fig.dpi_scale_trans.inverted())
+                fig.savefig(ziel_pfad, dpi=200, bbox_inches=bbox)
+                self._status(f"Diagramm gespeichert: {ziel_pfad}", "#00ff88")
+            except Exception as e:
+                messagebox.showerror("Download-Fehler", f"Konnte Diagramm nicht speichern:\n{e}")
+
+        def lade_hoehenverlauf_herunter():
+            speichere_diagrammausschnitt(ax_hoehe, "hoehenverlauf")
+
+        def lade_schmelzverlauf_herunter():
+            speichere_diagrammausschnitt(ax_form, "schmelzverlauf")
+
+        # Zwei kleine runde Download-Buttons in der Leiste über den
+        # Diagrammen: linker Button über dem linken (Höhenverlauf), rechter
+        # Button über dem rechten Diagramm (Schmelzverlauf) - "↓" statt
+        # Emoji "⬇", da Emoji je nach Schriftart nur als Fragezeichen
+        # dargestellt wird.
+        download_button_links = ctk.CTkButton(
+            button_leiste, text="↓", width=30, height=30, corner_radius=15,
+            fg_color=MUL_TURKIS, hover_color=MUL_DUNKEL, font=("Arial", 14, "bold"),
+            command=lade_hoehenverlauf_herunter,
+        )
+        download_button_links.grid(row=0, column=0, sticky="e", padx=(0, 6), pady=(0, 4))
+
+        download_button_rechts = ctk.CTkButton(
+            button_leiste, text="↓", width=30, height=30, corner_radius=15,
+            fg_color=MUL_TURKIS, hover_color=MUL_DUNKEL, font=("Arial", 14, "bold"),
+            command=lade_schmelzverlauf_herunter,
+        )
+        download_button_rechts.grid(row=0, column=1, sticky="e", padx=(6, 0), pady=(0, 4))
 
         def zeige_versuch(anzeige):
             zustand["versuch_name"] = anzeige_zu_name.get(anzeige, anzeige)
@@ -1234,7 +1299,7 @@ class LaborApp(ctk.CTk):
             eingabe_y_label.pack(fill="x", padx=10, pady=(2, 10))
 
             ctk.CTkLabel(
-                inhalt, text="X-Achsen-Beschriftung:", anchor="w",
+                inhalt, text="X-Achsen-Beschriftung (gilt auch für Farbskala rechts):", anchor="w",
             ).pack(fill="x", padx=10)
             eingabe_x_label = ctk.CTkEntry(inhalt)
             eingabe_x_label.insert(0, zustand["label_x"])
@@ -1475,8 +1540,34 @@ class LaborApp(ctk.CTk):
     # ------------------------------------------------------------------
     def erstelle_versuchs_struktur(self, projekt, staub, methode):
         base_dir = os.path.join(self.get_projekt_root(projekt), staub, methode)
-        for sub in ["data/raw_data", "data/processed_data", "diagram"]:
+        # data/raw_data + data/processed_data: Rohdaten und verarbeitete Daten
+        # liegen gemeinsam im Überordner "data". outputs/diagramm: Ziel für
+        # heruntergeladene Diagramm-Bilder (siehe Download-Buttons im
+        # Ergebnisse-Tab).
+        for sub in ["data/raw_data", "data/processed_data", "outputs/diagramm"]:
             os.makedirs(os.path.join(base_dir, sub), exist_ok=True)
+
+    def diagramm_ordner_fuer(self, raw_data_ordner):
+        """
+        Zielordner für heruntergeladene Diagramm-Bilder, gespiegelt vom
+        tatsächlichen raw_data-Ordner des Versuchs (analog zu
+        processed_data_ordner_fuer) - funktioniert für BEIDE unterstützten
+        Strukturen (siehe finde_raw_data_ordner):
+          .../<Methode>/data/raw_data  -> .../<Methode>/outputs/diagramm
+          .../<Methode>/raw_data       -> .../<Methode>/outputs/diagramm
+        Wird bei Bedarf angelegt (inkl. "outputs", falls noch nicht vorhanden).
+        """
+        data_raw_suffix = os.path.join("data", "raw_data")
+        if raw_data_ordner.endswith(os.sep + data_raw_suffix):
+            methode_ordner = raw_data_ordner[: -(len(data_raw_suffix) + 1)]
+        elif raw_data_ordner.endswith(os.sep + "raw_data"):
+            methode_ordner = raw_data_ordner[: -(len("raw_data") + 1)]
+        else:
+            methode_ordner = os.path.dirname(raw_data_ordner)
+
+        ziel_ordner = os.path.join(methode_ordner, "outputs", "diagramm")
+        os.makedirs(ziel_ordner, exist_ok=True)
+        return ziel_ordner
 
 
 if __name__ == "__main__":

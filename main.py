@@ -896,7 +896,7 @@ class LaborApp(ctk.CTk):
                         emi_parameter["durchfluss"],
                     ]
                 else:
-                    werte = [versuch_name, "Noch keine passende Zeile im Sheet gefunden.", "", "", "", ""]
+                    werte = [versuch_name, "-", "-", "-", "-", "-"]
             else:
                 werte = [versuch_name, "Für diese Methode noch keine Sheet-Anbindung."]
 
@@ -957,14 +957,60 @@ class LaborApp(ctk.CTk):
             ).pack(side="right", padx=20)
 
     # ------------------------------------------------------------------
+    # DIAGRAMM-EINSTELLUNGEN (Titel/Labels/Achsenbereiche) - dauerhaft
+    # ------------------------------------------------------------------
+    def _pfad_diagramm_einstellungen(self, projekt, methode):
+        """Eine JSON-Datei pro Projekt+Methode im Projekt-Root, versteckt (führender Punkt)."""
+        root = self.get_projekt_root(projekt)
+        return os.path.join(root, f".diagramm_einstellungen_{methode}.json")
+
+    def lade_diagramm_einstellungen(self, projekt, methode, standard):
+        """
+        Lädt gespeicherte Diagramm-Einstellungen von der Platte und legt sie
+        über die Standardwerte (Fallback, falls Datei fehlt/fehlerhaft oder
+        neue Felder seit dem letzten Speichern dazugekommen sind).
+        """
+        pfad = self._pfad_diagramm_einstellungen(projekt, methode)
+        zustand = dict(standard)
+        try:
+            with open(pfad, "r", encoding="utf-8") as f:
+                gespeichert = json.load(f)
+            for schluessel, wert in gespeichert.items():
+                if schluessel in zustand:
+                    zustand[schluessel] = wert
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        return zustand
+
+    def speichere_diagramm_einstellungen(self, projekt, methode, zustand):
+        """Schreibt die aktuellen Diagramm-Einstellungen auf die Platte (bleiben nach Neustart erhalten)."""
+        pfad = self._pfad_diagramm_einstellungen(projekt, methode)
+        speicherbar = {k: v for k, v in zustand.items() if k != "versuch_name"}
+        try:
+            os.makedirs(os.path.dirname(pfad), exist_ok=True)
+            with open(pfad, "w", encoding="utf-8") as f:
+                json.dump(speicherbar, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"[Diagramm-Einstellungen speichern Fehler] {pfad}: {e}")
+
+    # ------------------------------------------------------------------
     # TAB: ERGEBNISSE (Höhenverlauf + Form pro Versuch, aus processed_data)
     # ------------------------------------------------------------------
     def baue_ergebnisse_tab(self, parent, projekt, methode):
         """
         Zeigt pro (bereits verarbeitetem) Versuch den Höhenverlauf
-        (sample_height_px über Temperature) und die Form/Kontur
-        (contour_x/contour_y) aus der zugehörigen <versuch>_results.parquet-
-        Datei. Jeder Versuch hat seine eigene Form, daher Auswahl per Dropdown.
+        (sample_height_px über Temperature) und den Schmelzverlauf (alle
+        Konturen übereinander, nach Temperatur eingefärbt) aus der
+        zugehörigen <versuch>_results.parquet-Datei.
+
+        Layout: linke Seitenleiste mit Versuchsauswahl (Anzeige als
+        "Material – Kommentar" statt nur der M...-Nummer) + Settings-Button
+        zum Umbenennen der Achsenbeschriftungen; rechts die Diagramme.
+
+        Figure/Canvas werden nur EINMAL erzeugt - beim Versuchswechsel wird
+        nur der Achseninhalt neu gezeichnet (ax.clear() + canvas.draw()),
+        nicht das ganze Widget neu aufgebaut. Das verhindert den sichtbaren
+        "Sprung"/das Ruckeln beim Umschalten zwischen Versuchen.
         """
         if methode != "EMI":
             ctk.CTkLabel(
@@ -985,32 +1031,306 @@ class LaborApp(ctk.CTk):
             ).pack(pady=20)
             return
 
-        auswahl_zeile = ctk.CTkFrame(parent, fg_color="transparent")
-        auswahl_zeile.pack(fill="x", padx=10, pady=(10, 5))
-        ctk.CTkLabel(auswahl_zeile, text="Versuch:", font=("Arial", 12, "bold")).pack(
-            side="left", padx=(0, 10)
-        )
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.cm as cm
+            import matplotlib.colors as mcolors
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            import numpy as np
+        except ImportError:
+            ctk.CTkLabel(
+                parent,
+                text="matplotlib/numpy ist nicht installiert - 'pip install matplotlib numpy' im GUI-Environment nötig.",
+                wraplength=560,
+            ).pack(pady=20)
+            return
 
-        plot_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        plot_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        # Zustand, der über Versuchswechsel & Settings-Dialog hinweg erhalten
+        # bleibt UND dauerhaft auf der Platte gespeichert wird (siehe
+        # lade_/speichere_diagramm_einstellungen), also auch nach dem
+        # Schließen und Neustarten des Programms erhalten bleibt.
+        # x_min/x_max/y_min/y_max = None bedeutet "automatisch" (an Daten anpassen).
+        # farbskala_min/farbskala_max = None bedeutet "automatisch" (folgt
+        # x_min/x_max des Höhenverlaufs links, siehe unten).
+        zustand_standard = {
+            "versuch_name": None,
+            "title_hoehe": "Höhenverlauf",
+            "label_x": "Temperature [°C]",
+            "label_y": "Sample Height [% of initial]",
+            "x_min": 600,
+            "x_max": None,
+            "y_min": None,
+            "y_max": None,
+            "title_form": "Schmelzverlauf (alle Konturen, nach Temperatur eingefärbt)",
+            "label_x_form": "x [px]",
+            "label_y_form": "y [px]",
+            "y_min_form": None,
+            "y_max_form": None,
+            "farbskala_min": None,
+            "farbskala_max": None,
+        }
+        zustand = self.lade_diagramm_einstellungen(projekt, methode, zustand_standard)
 
-        versuch_namen = [os.path.splitext(eintrag)[0] for _s, eintrag, _p in verarbeitete_versuche]
+        # Fallback-Grenzen der Farbskala, falls weder x_min/x_max links noch
+        # eine explizite Farbskala-Einstellung vorhanden sind.
+        FARBSKALA_MIN_STANDARD = 200
+        FARBSKALA_MAX_STANDARD = 1600
 
-        def zeige_versuch(versuch_name):
-            for widget in plot_frame.winfo_children():
-                widget.destroy()
+        def farbskala_grenzen():
+            """
+            Effektive Farbskala-Grenzen: explizite Einstellung hat Vorrang,
+            sonst folgt die Skala automatisch dem X-Achsen-Bereich links
+            (Höhenverlauf), sonst der Standard-Fallback.
+            """
+            vmin = zustand["farbskala_min"]
+            if vmin is None:
+                vmin = zustand["x_min"] if zustand["x_min"] is not None else FARBSKALA_MIN_STANDARD
+            vmax = zustand["farbskala_max"]
+            if vmax is None:
+                vmax = zustand["x_max"] if zustand["x_max"] is not None else FARBSKALA_MAX_STANDARD
+            return vmin, vmax
+
+        # --- Anzeige-Text (Material – Kommentar) <-> tatsächlicher Versuchsname ---
+        anzeige_zu_name = {}
+        anzeige_werte = []
+        for _s, eintrag, _p in verarbeitete_versuche:
+            versuch_name = os.path.splitext(eintrag)[0]
+            parameter = self.hole_emi_parameter_fuer_versuch(versuch_name)
+            if parameter and (parameter.get("material") or parameter.get("kommentar")):
+                material = parameter.get("material") or "-"
+                kommentar = parameter.get("kommentar") or "-"
+                anzeige = f"{material} – {kommentar}"
+            else:
+                anzeige = versuch_name
+            if anzeige in anzeige_zu_name:  # Eindeutigkeit sicherstellen
+                anzeige = f"{anzeige} [{versuch_name}]"
+            anzeige_zu_name[anzeige] = versuch_name
+            anzeige_werte.append(anzeige)
+
+        # --- Layout: Seitenleiste links, Diagramme rechts ---
+        haupt_layout = ctk.CTkFrame(parent, fg_color="transparent")
+        haupt_layout.pack(fill="both", expand=True, padx=10, pady=10)
+
+        seitenleiste = ctk.CTkFrame(haupt_layout, fg_color="transparent", width=170)
+        seitenleiste.pack(side="left", fill="y", padx=(0, 15))
+        seitenleiste.pack_propagate(False)
+
+        ctk.CTkLabel(seitenleiste, text="Versuch:", font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 5))
+
+        plot_frame = ctk.CTkFrame(haupt_layout, fg_color="transparent")
+        plot_frame.pack(side="left", fill="both", expand=True)
+
+        # Figure/Canvas EINMAL erzeugen (siehe Docstring oben)
+        fig, (ax_hoehe, ax_form) = plt.subplots(1, 2, figsize=(10, 4.6))
+        canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        cmap = plt.get_cmap("jet")
+        vmin_start, vmax_start = farbskala_grenzen()
+        sm = cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=vmin_start, vmax=vmax_start))
+        sm.set_array([])
+        farbskala = fig.colorbar(sm, ax=ax_form, shrink=0.85)
+
+        def zeichne():
+            versuch_name = zustand["versuch_name"]
+            if not versuch_name:
+                return
             eintrag_info = next(
                 (s, e, p) for s, e, p in verarbeitete_versuche
                 if os.path.splitext(e)[0] == versuch_name
             )
-            self.rendere_ergebnis_plot(plot_frame, eintrag_info)
+            # Farbskala VOR dem Zeichnen aktualisieren, falls sich x_min/x_max
+            # links oder eine explizite Farbskala-Einstellung geändert haben.
+            vmin, vmax = farbskala_grenzen()
+            sm.set_norm(mcolors.Normalize(vmin=vmin, vmax=vmax))
+            farbskala.update_normal(sm)
+            self.zeichne_ergebnis_plot(
+                eintrag_info, fig, ax_hoehe, ax_form, canvas, sm, farbskala, zustand, np, mcolors
+            )
+
+        def zeige_versuch(anzeige):
+            zustand["versuch_name"] = anzeige_zu_name.get(anzeige, anzeige)
+            zeichne()
+
+        def als_zahl_oder_none(text):
+            text = text.strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+
+        def live_kopplung(entry, label_widget, praefix, suffix=""):
+            """
+            Aktualisiert label_widget bei jedem Tastendruck in entry live mit
+            dessen aktuellem Text (z.B. Überschrift "Rechtes Diagramm (<Titel>)"
+            oder "Y-Achse (<Beschriftung>) von/bis:" - folgt sofort dem, was
+            man in das jeweilige Beschriftungsfeld eintippt).
+            """
+            def aktualisieren(_event=None):
+                wert = entry.get().strip() or "..."
+                label_widget.configure(text=f"{praefix}{wert}{suffix}")
+            entry.bind("<KeyRelease>", aktualisieren)
+
+        def oeffne_settings():
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("Diagramm-Einstellungen")
+            dialog.geometry("480x720")
+            dialog.minsize(420, 420)
+            dialog.resizable(True, True)
+            dialog.attributes("-topmost", True)
+            dialog.lift()
+            dialog.focus_force()
+
+            def uebernehmen():
+                zustand["title_hoehe"] = eingabe_titel_hoehe.get().strip() or zustand["title_hoehe"]
+                zustand["label_y"] = eingabe_y_label.get().strip() or zustand["label_y"]
+                zustand["label_x"] = eingabe_x_label.get().strip() or zustand["label_x"]
+                zustand["x_min"] = als_zahl_oder_none(eingabe_x_min.get())
+                zustand["x_max"] = als_zahl_oder_none(eingabe_x_max.get())
+                zustand["y_min"] = als_zahl_oder_none(eingabe_y_min.get())
+                zustand["y_max"] = als_zahl_oder_none(eingabe_y_max.get())
+
+                zustand["title_form"] = eingabe_titel_form.get().strip() or zustand["title_form"]
+                zustand["label_x_form"] = eingabe_x_label_form.get().strip() or zustand["label_x_form"]
+                zustand["label_y_form"] = eingabe_y_label_form.get().strip() or zustand["label_y_form"]
+                zustand["y_min_form"] = als_zahl_oder_none(eingabe_y_min_form.get())
+                zustand["y_max_form"] = als_zahl_oder_none(eingabe_y_max_form.get())
+                zustand["farbskala_min"] = als_zahl_oder_none(eingabe_farbskala_min.get())
+                zustand["farbskala_max"] = als_zahl_oder_none(eingabe_farbskala_max.get())
+
+                zeichne()
+                self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+                dialog.destroy()
+
+            # WICHTIG: Button-Leiste ZUERST mit side="bottom" packen, damit ihr
+            # Platz fest reserviert ist - sonst kann zu viel Inhalt darüber
+            # (wie beim "Berechnen"-Button vorher) den Button aus dem
+            # sichtbaren Bereich drücken und er wirkt "kaputt"/unklickbar.
+            button_zeile = ctk.CTkFrame(dialog, fg_color="transparent")
+            button_zeile.pack(side="bottom", fill="x", pady=10)
+            ctk.CTkButton(button_zeile, text="Übernehmen", fg_color=MUL_TURKIS, command=uebernehmen).pack()
+
+            inhalt = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+            inhalt.pack(fill="both", expand=True, padx=5, pady=(10, 0))
+
+            # --- Linkes Diagramm (Höhenverlauf) ---
+            header_links = ctk.CTkLabel(
+                inhalt, text=f"Linkes Diagramm ({zustand['title_hoehe']})",
+                font=("Arial", 13, "bold"), anchor="w",
+            )
+            header_links.pack(fill="x", padx=10, pady=(5, 5))
+
+            ctk.CTkLabel(inhalt, text="Titel:", anchor="w").pack(fill="x", padx=10)
+            eingabe_titel_hoehe = ctk.CTkEntry(inhalt)
+            eingabe_titel_hoehe.insert(0, zustand["title_hoehe"])
+            eingabe_titel_hoehe.pack(fill="x", padx=10, pady=(2, 10))
+            live_kopplung(eingabe_titel_hoehe, header_links, "Linkes Diagramm (", ")")
+
+            ctk.CTkLabel(inhalt, text="Y-Achsen-Beschriftung:", anchor="w").pack(fill="x", padx=10)
+            eingabe_y_label = ctk.CTkEntry(inhalt)
+            eingabe_y_label.insert(0, zustand["label_y"])
+            eingabe_y_label.pack(fill="x", padx=10, pady=(2, 10))
+
+            ctk.CTkLabel(
+                inhalt, text="X-Achsen-Beschriftung:", anchor="w",
+            ).pack(fill="x", padx=10)
+            eingabe_x_label = ctk.CTkEntry(inhalt)
+            eingabe_x_label.insert(0, zustand["label_x"])
+            eingabe_x_label.pack(fill="x", padx=10, pady=(2, 10))
+
+            bereich_zeile_x = ctk.CTkFrame(inhalt, fg_color="transparent")
+            bereich_zeile_x.pack(fill="x", padx=10, pady=(0, 10))
+            ctk.CTkLabel(bereich_zeile_x, text="X-Achse von/bis:", width=110, anchor="w").pack(side="left")
+            eingabe_x_min = ctk.CTkEntry(bereich_zeile_x, placeholder_text="z.B. 600")
+            eingabe_x_min.insert(0, "" if zustand["x_min"] is None else str(zustand["x_min"]))
+            eingabe_x_min.pack(side="left", padx=(5, 5), fill="x", expand=True)
+            eingabe_x_max = ctk.CTkEntry(bereich_zeile_x, placeholder_text="auto")
+            eingabe_x_max.insert(0, "" if zustand["x_max"] is None else str(zustand["x_max"]))
+            eingabe_x_max.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+            bereich_zeile_y = ctk.CTkFrame(inhalt, fg_color="transparent")
+            bereich_zeile_y.pack(fill="x", padx=10, pady=(0, 10))
+            ctk.CTkLabel(bereich_zeile_y, text="Y-Achse von/bis:", width=110, anchor="w").pack(side="left")
+            eingabe_y_min = ctk.CTkEntry(bereich_zeile_y, placeholder_text="auto")
+            eingabe_y_min.insert(0, "" if zustand["y_min"] is None else str(zustand["y_min"]))
+            eingabe_y_min.pack(side="left", padx=(5, 5), fill="x", expand=True)
+            eingabe_y_max = ctk.CTkEntry(bereich_zeile_y, placeholder_text="auto")
+            eingabe_y_max.insert(0, "" if zustand["y_max"] is None else str(zustand["y_max"]))
+            eingabe_y_max.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+            # --- Trennlinie ---
+            ctk.CTkFrame(inhalt, height=2, fg_color=("gray75", "gray30")).pack(fill="x", padx=10, pady=(5, 15))
+
+            # --- Rechtes Diagramm (Schmelzverlauf) ---
+            header_rechts = ctk.CTkLabel(
+                inhalt, text=f"Rechtes Diagramm ({zustand['title_form']})",
+                font=("Arial", 13, "bold"), anchor="w",
+            )
+            header_rechts.pack(fill="x", padx=10, pady=(0, 5))
+
+            ctk.CTkLabel(inhalt, text="Titel:", anchor="w").pack(fill="x", padx=10)
+            eingabe_titel_form = ctk.CTkEntry(inhalt)
+            eingabe_titel_form.insert(0, zustand["title_form"])
+            eingabe_titel_form.pack(fill="x", padx=10, pady=(2, 10))
+            live_kopplung(eingabe_titel_form, header_rechts, "Rechtes Diagramm (", ")")
+
+            ctk.CTkLabel(inhalt, text="X-Achsen-Beschriftung:", anchor="w").pack(fill="x", padx=10)
+            eingabe_x_label_form = ctk.CTkEntry(inhalt)
+            eingabe_x_label_form.insert(0, zustand["label_x_form"])
+            eingabe_x_label_form.pack(fill="x", padx=10, pady=(2, 10))
+
+            ctk.CTkLabel(inhalt, text="Y-Achsen-Beschriftung:", anchor="w").pack(fill="x", padx=10)
+            eingabe_y_label_form = ctk.CTkEntry(inhalt)
+            eingabe_y_label_form.insert(0, zustand["label_y_form"])
+            eingabe_y_label_form.pack(fill="x", padx=10, pady=(2, 10))
+
+            bereich_zeile_y_form = ctk.CTkFrame(inhalt, fg_color="transparent")
+            bereich_zeile_y_form.pack(fill="x", padx=10, pady=(0, 10))
+            label_bereich_y_form = ctk.CTkLabel(
+                bereich_zeile_y_form, text=f"Y-Achse ({zustand['label_y_form']}) von/bis:", width=110, anchor="w",
+            )
+            label_bereich_y_form.pack(side="left")
+            eingabe_y_min_form = ctk.CTkEntry(bereich_zeile_y_form, placeholder_text="auto")
+            eingabe_y_min_form.insert(0, "" if zustand["y_min_form"] is None else str(zustand["y_min_form"]))
+            eingabe_y_min_form.pack(side="left", padx=(5, 5), fill="x", expand=True)
+            eingabe_y_max_form = ctk.CTkEntry(bereich_zeile_y_form, placeholder_text="auto")
+            eingabe_y_max_form.insert(0, "" if zustand["y_max_form"] is None else str(zustand["y_max_form"]))
+            eingabe_y_max_form.pack(side="left", padx=(5, 0), fill="x", expand=True)
+            live_kopplung(eingabe_y_label_form, label_bereich_y_form, "Y-Achse (", ") von/bis:")
+
+            bereich_zeile_farbskala = ctk.CTkFrame(inhalt, fg_color="transparent")
+            bereich_zeile_farbskala.pack(fill="x", padx=10, pady=(0, 5))
+            ctk.CTkLabel(bereich_zeile_farbskala, text="Farbskala von/bis:", width=110, anchor="w").pack(side="left")
+            eingabe_farbskala_min = ctk.CTkEntry(bereich_zeile_farbskala, placeholder_text="auto (= X-Achse von)")
+            eingabe_farbskala_min.insert(0, "" if zustand["farbskala_min"] is None else str(zustand["farbskala_min"]))
+            eingabe_farbskala_min.pack(side="left", padx=(5, 5), fill="x", expand=True)
+            eingabe_farbskala_max = ctk.CTkEntry(bereich_zeile_farbskala, placeholder_text="auto (= X-Achse bis)")
+            eingabe_farbskala_max.insert(0, "" if zustand["farbskala_max"] is None else str(zustand["farbskala_max"]))
+            eingabe_farbskala_max.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+            ctk.CTkLabel(
+                inhalt,
+                text=(
+                    "Der Schmelzverlauf rechts zeigt automatisch nur die Konturen im\n"
+                    "gewählten X-Achsen-Bereich links. Die Farbskala folgt automatisch\n"
+                    "demselben Bereich (X-Achse von/bis), kann hier aber auch abweichend\n"
+                    "fest eingestellt werden - leer lassen für \"automatisch\"."
+                ),
+                text_color=("gray40", "gray70"), font=("Arial", 10), justify="left",
+            ).pack(fill="x", padx=10, pady=(0, 10))
 
         dropdown = ctk.CTkOptionMenu(
-            auswahl_zeile, values=versuch_namen, command=zeige_versuch, fg_color=MUL_TURKIS,
+            seitenleiste, values=anzeige_werte, command=zeige_versuch, fg_color=MUL_TURKIS,
         )
-        dropdown.pack(side="left")
+        dropdown.pack(fill="x", pady=(0, 15))
 
-        zeige_versuch(versuch_namen[0])
+        ctk.CTkButton(
+            seitenleiste, text="Settings", fg_color=MUL_DUNKEL, command=oeffne_settings,
+        ).pack(fill="x")
+
+        zeige_versuch(anzeige_werte[0])
 
     def lade_ergebnis_dataframe(self, eintrag, voller_pfad):
         """Lädt <versuch>_results.parquet aus processed_data als pandas DataFrame, oder None."""
@@ -1036,29 +1356,26 @@ class LaborApp(ctk.CTk):
             print(f"[Ergebnis-Parquet Fehler] {parquet_pfad}: {e}")
             return None
 
-    def rendere_ergebnis_plot(self, parent, eintrag_info):
-        """Zeichnet Höhenverlauf (links) und letzte gültige Form/Kontur (rechts) für einen Versuch."""
+    def zeichne_ergebnis_plot(
+        self, eintrag_info, fig, ax_hoehe, ax_form, canvas, sm, farbskala, zustand, np, mcolors
+    ):
+        """
+        Zeichnet Höhenverlauf (links) und Schmelzverlauf (rechts, alle
+        Konturen nach Temperatur eingefärbt) für einen Versuch NEU in die
+        bereits bestehenden Achsen (ax.clear() statt neues Canvas-Widget) -
+        das ist der Schlüssel gegen den Lade-"Sprung" beim Versuchswechsel.
+        """
         staub, eintrag, voller_pfad = eintrag_info
         df = self.lade_ergebnis_dataframe(eintrag, voller_pfad)
 
+        ax_hoehe.clear()
+        ax_form.clear()
+
         if df is None or df.empty:
-            ctk.CTkLabel(
-                parent, text="Konnte processed_data nicht laden (siehe Konsole für Details)."
-            ).pack(pady=20)
+            ax_hoehe.text(0.5, 0.5, "Konnte processed_data nicht laden.", ha="center", va="center")
+            ax_form.text(0.5, 0.5, "Konnte processed_data nicht laden.", ha="center", va="center")
+            canvas.draw_idle()
             return
-
-        try:
-            import matplotlib.pyplot as plt
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        except ImportError:
-            ctk.CTkLabel(
-                parent,
-                text="matplotlib ist nicht installiert - 'pip install matplotlib' im GUI-Environment nötig.",
-                wraplength=560,
-            ).pack(pady=20)
-            return
-
-        fig, (ax_hoehe, ax_form) = plt.subplots(1, 2, figsize=(9, 4.2))
 
         # --- Höhenverlauf ---
         if "Temperature" in df.columns and "sample_height_px" in df.columns:
@@ -1068,34 +1385,90 @@ class LaborApp(ctk.CTk):
                 if referenz_hoehe:
                     hoehe_rel_pct = gueltig["sample_height_px"] / referenz_hoehe * 100
                     ax_hoehe.plot(gueltig["Temperature"], hoehe_rel_pct, color=MUL_TURKIS, linewidth=2)
-        ax_hoehe.set_xlabel("Temperature [°C]")
-        ax_hoehe.set_ylabel("Sample Height [% of initial]")
-        ax_hoehe.set_title("Höhenverlauf")
+        ax_hoehe.set_xlabel(zustand["label_x"])
+        ax_hoehe.set_ylabel(zustand["label_y"])
+        ax_hoehe.set_title(zustand["title_hoehe"])
+        ax_hoehe.set_xlim(left=zustand["x_min"], right=zustand["x_max"])
+        ax_hoehe.set_ylim(bottom=zustand["y_min"], top=zustand["y_max"])
         ax_hoehe.grid(True, alpha=0.3)
 
-        # --- Form / Kontur (letzte gültige, meist bei höchster Temperatur) ---
-        letzte_kontur = None
-        if "contour_x" in df.columns and "contour_y" in df.columns:
-            for _, zeile in df.iloc[::-1].iterrows():
-                cx, cy = zeile.get("contour_x"), zeile.get("contour_y")
-                if cx is not None and cy is not None and len(cx) > 0:
-                    letzte_kontur = (cx, cy)
-                    break
-        if letzte_kontur:
-            cx, cy = letzte_kontur
-            ax_form.plot(cx, cy, color=MUL_DUNKEL, linewidth=2)
+        # --- Form: kompletter Schmelzverlauf, alle Konturen übereinander,
+        # nach Temperatur eingefärbt (wie bei den bunten Referenzplots).
+        # Zeigt nur Konturen im selben X-Achsen-Bereich wie der Höhenverlauf
+        # links - Farbskala rechts bleibt dabei aber IMMER fix. ---
+        if (
+            "contour_x" in df.columns
+            and "contour_y" in df.columns
+            and "Temperature" in df.columns
+        ):
+            gueltige = df.dropna(subset=["contour_x", "contour_y", "Temperature"]).copy()
+            gueltige = gueltige[
+                gueltige["contour_x"].apply(lambda w: w is not None and len(w) > 0)
+            ]
+            if zustand["x_min"] is not None:
+                gueltige = gueltige[gueltige["Temperature"] >= zustand["x_min"]]
+            if zustand["x_max"] is not None:
+                gueltige = gueltige[gueltige["Temperature"] <= zustand["x_max"]]
+        else:
+            gueltige = None
+
+        if gueltige is not None and not gueltige.empty:
+            gueltige = gueltige.sort_values("Temperature")
+
+            # Auf max. ~60 Konturen ausdünnen, sonst wird der Plot zu voll/langsam
+            max_konturen = 60
+            if len(gueltige) > max_konturen:
+                indizes = np.linspace(0, len(gueltige) - 1, max_konturen).round().astype(int)
+                gueltige = gueltige.iloc[sorted(set(indizes))]
+
+            norm = sm.norm  # fix (siehe FARBSKALA_MIN/MAX in baue_ergebnisse_tab)
+            cmap = sm.get_cmap()
+
+            # Gemeinsame Grundlinie (unterste Kante über alle Konturen), damit
+            # jede Form bis zur Probenhalter-Linie "gefüllt" wird.
+            grundlinie = max(np.nanmax(np.asarray(cy, dtype=float)) for cy in gueltige["contour_y"])
+
+            # Von kalt -> heiß zeichnen: kühle (hohe, schmale) Formen liegen
+            # unten im Stapel, heißere (geschmolzene, breitere) werden zuletzt
+            # darüber gezeichnet - Ränder der kühleren Formen bleiben als
+            # dünne Farbringe sichtbar.
+            for _, zeile in gueltige.iterrows():
+                cx = np.asarray(zeile["contour_x"], dtype=float)
+                cy = np.asarray(zeile["contour_y"], dtype=float)
+                reihenfolge = np.argsort(cx)
+                cx, cy = cx[reihenfolge], cy[reihenfolge]
+                farbe = cmap(norm(zeile["Temperature"]))
+                ax_form.fill_between(cx, cy, grundlinie, color=farbe, linewidth=0)
+
             ax_form.invert_yaxis()
             ax_form.set_aspect("equal", adjustable="box")
-        ax_form.set_xlabel("x [px]")
-        ax_form.set_ylabel("y [px]")
-        ax_form.set_title("Form (letzte gültige Kontur)")
-        ax_form.grid(True, alpha=0.3)
+
+            # Y-Achse (px) rechts optional fest einstellbar - "von" = kleinerer
+            # Pixelwert (oben im Bild), "bis" = größerer Pixelwert (unten im
+            # Bild), passend zur invertierten Achse. Fehlt einer der beiden
+            # Werte, bleibt dieser bei der automatischen Grenze.
+            if zustand["y_min_form"] is not None or zustand["y_max_form"] is not None:
+                aktuell_unten, aktuell_oben = ax_form.get_ylim()
+                unten = zustand["y_max_form"] if zustand["y_max_form"] is not None else aktuell_unten
+                oben = zustand["y_min_form"] if zustand["y_min_form"] is not None else aktuell_oben
+                ax_form.set_ylim(bottom=unten, top=oben)
+        elif gueltige is not None:
+            ax_form.text(
+                0.5, 0.5, "Keine Kontur im gewählten Bereich.", ha="center", va="center",
+                transform=ax_form.transAxes,
+            )
+
+        # Nur die Beschriftung der Farbskala ist änderbar - die
+        # Werte/Skalierung (norm) selbst bleiben fix (siehe oben).
+        farbskala.set_label(zustand["label_x"])
+
+        ax_form.set_xlabel(zustand["label_x_form"])
+        ax_form.set_ylabel(zustand["label_y_form"])
+        ax_form.set_title(zustand["title_form"])
+        ax_form.grid(True, alpha=0.2)
 
         fig.tight_layout()
-
-        canvas = FigureCanvasTkAgg(fig, master=parent)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
+        canvas.draw_idle()
 
     # ------------------------------------------------------------------
     # HILFSFUNKTIONEN (Ordnerstruktur)

@@ -1149,6 +1149,10 @@ class LaborApp(ctk.CTk):
     def baue_rohdaten_tab(self, parent, projekt, methode):
         """Zeigt die Datei-/Ordnerliste aus raw_data (ohne Verarbeitet-Häkchen)
         und einen 'Berechnen'-Button unten rechts."""
+        if methode == "TGA":
+            self.baue_rohdaten_tab_tga(parent, projekt, methode)
+            return
+
         versuche = self.liste_versuche(projekt, methode)
 
         if not versuche:
@@ -1229,6 +1233,606 @@ class LaborApp(ctk.CTk):
                 json.dump(speicherbar, f, ensure_ascii=False, indent=2)
         except OSError as e:
             print(f"[Diagramm-Einstellungen speichern Fehler] {pfad}: {e}")
+
+    # ------------------------------------------------------------------
+    # ROHDATEN-VORSCHAU (TGA): Filter-1/Filter-2 Einstellungen - eigene
+    # Ablagedatei, damit sie NICHT mit den Ergebnisse-Tab-Einstellungen
+    # kollidiert (speichere_diagramm_einstellungen() ueberschreibt die
+    # komplette Datei mit dem jeweils uebergebenen zustand-Dict).
+    # ------------------------------------------------------------------
+    def _pfad_rohdaten_filter_einstellungen(self, projekt, methode):
+        root = self.get_projekt_root(projekt)
+        return os.path.join(root, f".rohdaten_filter_einstellungen_{methode}.json")
+
+    def lade_rohdaten_filter_einstellungen(self, projekt, methode, standard):
+        pfad = self._pfad_rohdaten_filter_einstellungen(projekt, methode)
+        zustand = dict(standard)
+        try:
+            with open(pfad, "r", encoding="utf-8") as f:
+                gespeichert = json.load(f)
+            for schluessel, wert in gespeichert.items():
+                if schluessel in zustand:
+                    zustand[schluessel] = wert
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        return zustand
+
+    def speichere_rohdaten_filter_einstellungen(self, projekt, methode, zustand):
+        pfad = self._pfad_rohdaten_filter_einstellungen(projekt, methode)
+        try:
+            os.makedirs(os.path.dirname(pfad), exist_ok=True)
+            with open(pfad, "w", encoding="utf-8") as f:
+                json.dump(zustand, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"[Rohdaten-Filter-Einstellungen speichern Fehler] {pfad}: {e}")
+
+    def _lade_rohdaten_dataframe_tga(self, voller_pfad):
+        """
+        Liest eine rohe TGA-.txt-Datei (Time(s), Temperature(...C), Delta
+        m(mg), ...) DIREKT ein - fuer die Live-Vorschau im Rohdaten-Tab,
+        BEVOR "Berechnen" gedrueckt wurde. Portierung der Kernlogik aus
+        TGA_calculation.py (_get_weight_mg / _read_raw_dataframe /
+        _find_column), ohne Abhaengigkeit von project_paths.py.
+
+        Gibt ein pandas DataFrame mit den Spalten time_min, temperature_C,
+        dm_original_mg zurueck (chronologisch sortiert), oder None bei
+        Fehlern (fehlende Spalten, kein Startgewicht, kein gueltiges
+        Rohdaten-Format, o.ae.).
+        """
+        import re
+        import pandas as pd
+
+        if not os.path.isfile(voller_pfad):
+            return None
+
+        gewicht_pattern = re.compile(r"Weight:\s*([0-9]+\.?[0-9]*)\s*mg", re.IGNORECASE)
+        startgewicht = None
+        header_zeile = None
+        try:
+            with open(voller_pfad, encoding="ISO-8859-1") as f:
+                for i, zeile in enumerate(f):
+                    if zeile.startswith("#"):
+                        treffer = gewicht_pattern.search(zeile)
+                        if treffer:
+                            startgewicht = float(treffer.group(1))
+                    elif zeile.startswith("Time(s)"):
+                        header_zeile = i
+                        break
+        except OSError:
+            return None
+
+        if not startgewicht or header_zeile is None:
+            return None
+
+        try:
+            raw = pd.read_csv(
+                voller_pfad, delimiter=",", header=header_zeile, encoding="unicode_escape"
+            )
+        except Exception as e:
+            print(f"[Rohdaten-Vorschau] Konnte {voller_pfad} nicht lesen: {e}")
+            return None
+
+        def _finde_spalte(spalten, *teilstrings):
+            for spalte in spalten:
+                klein = str(spalte).lower()
+                if all(s.lower() in klein for s in teilstrings):
+                    return spalte
+            return None
+
+        zeit_spalte = _finde_spalte(raw.columns, "time")
+        temp_spalte = _finde_spalte(raw.columns, "temperat")
+        dm_spalte = _finde_spalte(raw.columns, "delta", "m")
+        if not (zeit_spalte and temp_spalte and dm_spalte):
+            return None
+
+        try:
+            df = pd.DataFrame({
+                "time_min": raw[zeit_spalte].astype(float) / 60.0,
+                "temperature_C": raw[temp_spalte].astype(float),
+                "dm_original_mg": raw[dm_spalte].astype(float),
+            }).dropna(subset=["time_min", "temperature_C", "dm_original_mg"])
+        except Exception as e:
+            print(f"[Rohdaten-Vorschau] Ungueltige Werte in {voller_pfad}: {e}")
+            return None
+
+        if df.empty:
+            return None
+        return df.sort_values("time_min").reset_index(drop=True)
+
+    def _rohdaten_filter_parameter_ansicht(self, zustand, praefix):
+        """
+        Liefert ein Dict mit den (NICHT praefigierten) Basis-Schluesseln aus
+        TGA_FILTER_PARAMETER, dessen Werte aus den PRAEFIGIERTEN
+        zustand-Eintraegen (z.B. "f1_filter_butter_cutoff") gelesen werden -
+        passend zur Signatur von _baue_filter_objekt().
+        """
+        ansicht = {}
+        for felder in TGA_FILTER_PARAMETER.values():
+            for schluessel, _label, _default in felder:
+                ansicht[schluessel] = zustand.get(f"{praefix}_{schluessel}")
+        return ansicht
+
+    def _baue_filter_objekt(self, typ, parameter):
+        """
+        Baut ein Filter-Objekt aus helper/Filter.py fuer den gegebenen
+        Typnamen (siehe TGA_FILTER_OPTIONEN). `parameter` ist ein Dict mit
+        den NICHT praefigierten Basis-Schluesseln aus TGA_FILTER_PARAMETER
+        (z.B. {"filter_butter_cutoff": 0.05, "filter_butter_order": 2}).
+
+        Gibt None zurueck bei "Kein Filter", fehlendem Import (siehe
+        _FILTER_IMPORT_FEHLER) oder ungueltigen Werten - der Aufrufer soll
+        dann die ungefilterten Werte anzeigen.
+        """
+        if typ == "Kein Filter" or ButterworthFilter is None:
+            return None
+        try:
+            if typ == "Butterworth":
+                return ButterworthFilter(
+                    cutoff=float(parameter.get("filter_butter_cutoff", 0.05)),
+                    order=int(parameter.get("filter_butter_order", 2)),
+                    time_unit="sec",
+                )
+            if typ == "Savitzky-Golay":
+                fenster = int(parameter.get("filter_savgol_window", 15))
+                if fenster % 2 == 0:
+                    fenster += 1
+                return SavitzkyGolayFilter(
+                    window_length=fenster,
+                    polyorder=int(parameter.get("filter_savgol_polyorder", 2)),
+                )
+            if typ == "Exponentielles gleitendes Mittel":
+                return ExponentialMovingAverage(alpha=float(parameter.get("filter_ema_alpha", 0.3)))
+            if typ == "Median":
+                kernel = int(parameter.get("filter_median_kernel", 9))
+                if kernel % 2 == 0:
+                    kernel += 1
+                return MedianFilter(kernel_size=kernel)
+            if typ == "Gaussian":
+                return GaussianFilter(sigma=float(parameter.get("filter_gauss_sigma", 1.0)))
+            if typ == "Gleitender Mittelwert":
+                return RollingAverage(sampling_rate=int(parameter.get("filter_rollavg_fenster", 10)))
+        except Exception as e:
+            print(f"[Filter-Aufbau] Ungueltige Einstellungen ({typ}): {e}")
+            return None
+        return None
+
+    def zeichne_rohdaten_vorschau_tga(self, voller_pfad, fig, achsen, canvas, zustand):
+        """
+        Zeichnet die 2x2 Live-Vorschau im TGA-Rohdaten-Tab NEU:
+            oben:  Filter 1 auf die Massenkurve (dm)      - roh | gefiltert
+            unten: Filter 2 auf die Reaktionskinetik (dm/dt) - roh | gefiltert
+        dm/dt wird dabei (wie im echten TGA_calculation.py-Pipeline-Schritt)
+        aus der BEREITS mit Filter 1 geglaetteten dm-Kurve abgeleitet, bevor
+        Filter 2 zusaetzlich die Kinetik glaettet.
+        """
+        import numpy as np
+        import pandas as pd
+
+        ax_f1_roh, ax_f1_gefiltert, ax_f2_roh, ax_f2_gefiltert = achsen
+        for ax in achsen:
+            ax.clear()
+
+        df = self._lade_rohdaten_dataframe_tga(voller_pfad)
+        if df is None or df.empty:
+            for ax in achsen:
+                ax.text(
+                    0.5, 0.5, "Konnte Rohdaten nicht laden.",
+                    ha="center", va="center", transform=ax.transAxes,
+                )
+            canvas.draw_idle()
+            return
+
+        zeit = df["time_min"].to_numpy()
+        dm_roh = df["dm_original_mg"].to_numpy()
+
+        f1_typ = zustand.get("f1_filter_typ", "Kein Filter")
+        f1_filter = self._baue_filter_objekt(
+            f1_typ, self._rohdaten_filter_parameter_ansicht(zustand, "f1")
+        )
+        if f1_filter is not None:
+            try:
+                dm_gefiltert = f1_filter(df["time_min"], pd.Series(dm_roh)).to_numpy()
+            except Exception as e:
+                print(f"[Rohdaten-Filter-1] Fehlgeschlagen, zeige ungefiltert: {e}")
+                dm_gefiltert = dm_roh.copy()
+        else:
+            dm_gefiltert = dm_roh.copy()
+
+        dmdt_roh = (
+            pd.Series(dm_gefiltert).diff() / pd.Series(zeit).diff()
+        ).bfill().to_numpy()
+
+        f2_typ = zustand.get("f2_filter_typ", "Kein Filter")
+        f2_filter = self._baue_filter_objekt(
+            f2_typ, self._rohdaten_filter_parameter_ansicht(zustand, "f2")
+        )
+        if f2_filter is not None:
+            try:
+                x_index = pd.Series(np.arange(len(dmdt_roh), dtype=float))
+                dmdt_gefiltert = f2_filter(x_index, pd.Series(dmdt_roh)).to_numpy()
+            except Exception as e:
+                print(f"[Rohdaten-Filter-2] Fehlgeschlagen, zeige ungefiltert: {e}")
+                dmdt_gefiltert = dmdt_roh.copy()
+        else:
+            dmdt_gefiltert = dmdt_roh.copy()
+
+        ax_f1_roh.plot(zeit, dm_roh, color=MUL_TURKIS, linewidth=1.0)
+        ax_f1_roh.set_title(f"Filter 1: {f1_typ} (Rohdaten)")
+        ax_f1_roh.set_xlabel("Zeit [min]")
+        ax_f1_roh.set_ylabel("Delta m [mg]")
+        ax_f1_roh.grid(True, alpha=0.3)
+
+        ax_f1_gefiltert.plot(zeit, dm_gefiltert, color=MUL_TURKIS, linewidth=1.5)
+        ax_f1_gefiltert.set_title(f"Filter 1: {f1_typ} (gefiltert)")
+        ax_f1_gefiltert.set_xlabel("Zeit [min]")
+        ax_f1_gefiltert.set_ylabel("Delta m [mg]")
+        ax_f1_gefiltert.grid(True, alpha=0.3)
+
+        ax_f2_roh.plot(zeit, dmdt_roh, color=MUL_TURKIS, linewidth=1.0)
+        ax_f2_roh.axhline(0, linestyle="--", linewidth=0.5, color="grey")
+        ax_f2_roh.set_title(f"Filter 2: {f2_typ} (Rohdaten)")
+        ax_f2_roh.set_xlabel("Zeit [min]")
+        ax_f2_roh.set_ylabel("dm/dt [mg/min]")
+        ax_f2_roh.grid(True, alpha=0.3)
+
+        ax_f2_gefiltert.plot(zeit, dmdt_gefiltert, color=MUL_TURKIS, linewidth=1.5)
+        ax_f2_gefiltert.axhline(0, linestyle="--", linewidth=0.5, color="grey")
+        ax_f2_gefiltert.set_title(f"Filter 2: {f2_typ} (gefiltert)")
+        ax_f2_gefiltert.set_xlabel("Zeit [min]")
+        ax_f2_gefiltert.set_ylabel("dm/dt [mg/min]")
+        ax_f2_gefiltert.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # LAYOUT-HELFER: ziehbare Trennleiste (Griff) zwischen zwei Spalten +
+    # ein-/ausklappbare Seitenspalten - fuer den TGA-Rohdaten-Tab, damit
+    # die Versuchsliste links und die Filter-Einstellungen rechts per
+    # Maus breiter/schmaler gezogen bzw. komplett ein-/ausgeklappt werden
+    # koennen (mehr Platz fuer lange Versuchsnamen bzw. fuer die
+    # 2x2-Vorschau in der Mitte).
+    # ------------------------------------------------------------------
+    def _mache_griff_ziehbar(self, griff, ziel_frame, breite_merker, minimum=90, maximum=650, invertiert=False):
+        """
+        Bindet Maus-Drag-Events an `griff` (eine schmale CTkFrame-Leiste),
+        um die feste Breite von `ziel_frame` live zu veraendern.
+        `ziel_frame` MUSS `pack_propagate(False)` gesetzt haben, sonst hat
+        `width=...` keine Wirkung.
+
+        `breite_merker` ist ein Dict mit Schluessel "breite", in dem die
+        aktuell gueltige (ausgeklappte) Breite mitgefuehrt wird - so kann
+        eine Ein-/Ausklapp-Funktion nach dem Wiederausklappen exakt die
+        zuletzt gezogene Breite wiederherstellen statt immer auf den
+        urspruenglichen Startwert zurueckzuspringen.
+
+        `invertiert=True`, wenn der Griff LINKS vom ziel_frame liegt (z.B.
+        rechte Spalte): Ziehen nach links soll dann breiter machen statt
+        schmaler.
+        """
+        start = {"maus_x": 0, "breite": 0}
+
+        def _start(event):
+            start["maus_x"] = event.x_root
+            start["breite"] = ziel_frame.winfo_width()
+
+        def _ziehen(event):
+            delta = event.x_root - start["maus_x"]
+            if invertiert:
+                delta = -delta
+            neue_breite = max(minimum, min(maximum, start["breite"] + delta))
+            ziel_frame.configure(width=neue_breite)
+            breite_merker["breite"] = neue_breite
+
+        griff.bind("<Button-1>", _start)
+        griff.bind("<B1-Motion>", _ziehen)
+
+    def _mache_spalte_einklappbar(self, toggle_button, ziel_frame, inhalt_frame, breite_merker, eingeklappt_text, ausgeklappt_text, breite_eingeklappt=40):
+        """
+        Macht eine Seitenspalte per Button ein-/ausklappbar: im
+        eingeklappten Zustand wird `inhalt_frame` (Versuchsliste bzw.
+        Filter-Einstellungen) komplett ausgeblendet und `ziel_frame` auf
+        `breite_eingeklappt` verschmaelert - dadurch bekommt die mittlere
+        2x2-Vorschau spuerbar mehr Platz. Beim erneuten Ausklappen wird
+        exakt die zuletzt (ggf. per Ziehen veraenderte) Breite aus
+        `breite_merker["breite"]` wiederhergestellt.
+        """
+        zustand = {"offen": True}
+
+        def _umschalten():
+            if zustand["offen"]:
+                inhalt_frame.pack_forget()
+                ziel_frame.configure(width=breite_eingeklappt)
+                toggle_button.configure(text=ausgeklappt_text)
+                zustand["offen"] = False
+            else:
+                ziel_frame.configure(width=breite_merker["breite"])
+                inhalt_frame.pack(fill="both", expand=True)
+                toggle_button.configure(text=eingeklappt_text)
+                zustand["offen"] = True
+
+        toggle_button.configure(command=_umschalten)
+        return _umschalten
+
+    def baue_rohdaten_tab_tga(self, parent, projekt, methode):
+        """
+        TGA-Gegenstueck zu baue_rohdaten_tab (EMI/generisch): links die
+        Versuchsliste (mit "Verarbeitet"-Haekchen wie bisher, per Klick
+        waehlbar) + "Berechnen"-Button; in der Mitte eine 2x2-Live-Vorschau
+        direkt aus der rohen .txt-Datei (Filter 1 auf die Massenkurve dm,
+        Filter 2 auf die daraus abgeleitete Reaktionskinetik dm/dt - siehe
+        zeichne_rohdaten_vorschau_tga); rechts die Einstellungen fuer beide
+        Filter, komplett eingebettet (kein Popup wie im Ergebnisse-Tab).
+        """
+        versuche = self.liste_versuche(projekt, methode)
+        if not versuche:
+            ctk.CTkLabel(parent, text="Keine lokalen Rohdaten gefunden.").pack(pady=20)
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        except ImportError:
+            ctk.CTkLabel(
+                parent,
+                text="matplotlib ist nicht installiert - 'pip install matplotlib' im GUI-Environment noetig.",
+                wraplength=560,
+            ).pack(pady=20)
+            return
+
+        # --- Default-Zustand: fuer Filter 1 UND Filter 2 je alle moeglichen
+        # Filterparameter (praefigiert), damit beim Umschalten zwischen
+        # Filtertypen die zuletzt eingestellten Werte erhalten bleiben. ---
+        zustand_standard = {
+            "f1_filter_typ": "Gleitender Mittelwert",
+            "f2_filter_typ": "Butterworth",
+        }
+        for praefix in ("f1", "f2"):
+            for felder in TGA_FILTER_PARAMETER.values():
+                for schluessel, _label, default_text in felder:
+                    try:
+                        default_wert = float(default_text)
+                    except ValueError:
+                        default_wert = default_text
+                    zustand_standard[f"{praefix}_{schluessel}"] = default_wert
+        zustand = self.lade_rohdaten_filter_einstellungen(projekt, methode, zustand_standard)
+
+        haupt_layout = ctk.CTkFrame(parent, fg_color="transparent")
+        haupt_layout.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # --- Linke Spalte: Versuchsliste (mit Haekchen) + Berechnen ---
+        # Breite ist per Griff (rechts daneben) mit der Maus ziehbar und
+        # per Pfeil-Button in der Kopfzeile komplett einklappbar - damit
+        # lange Versuchsnamen, die vorher abgeschnitten wurden, bei Bedarf
+        # vollstaendig sichtbar gemacht werden koennen.
+        #
+        # WICHTIG: Die Kopfzeile enthaelt NUR den Einklapp-Button und bleibt
+        # IMMER in voller Groesse sichtbar (auch im eingeklappten Zustand) -
+        # vorher teilten sich "Versuche"/"Verarb."-Beschriftung und der
+        # Button dieselbe schmale Kopfzeile, wodurch beim Einklappen (Breite
+        # 40px) BEIDE abgeschnitten wurden und der Button nicht mehr
+        # antippbar/sichtbar war. Die Titelzeile mit "Versuche"/"Verarb."
+        # steckt jetzt zusammen mit der Liste in inhalt_links und wird beim
+        # Einklappen sauber mit ausgeblendet statt nur abgeschnitten.
+        linke_breite_merker = {"breite": 280}
+        linke_spalte = ctk.CTkFrame(haupt_layout, fg_color="transparent", width=linke_breite_merker["breite"])
+        linke_spalte.pack(side="left", fill="y", padx=(0, 0))
+        linke_spalte.pack_propagate(False)
+
+        kopfzeile = ctk.CTkFrame(linke_spalte, fg_color="transparent")
+        kopfzeile.pack(side="top", fill="x", padx=5, pady=(0, 5))
+        links_einklapp_btn = ctk.CTkButton(kopfzeile, text="◀", width=32, fg_color="transparent", border_width=1)
+        links_einklapp_btn.pack(side="left")
+
+        # Alles ausser dem Einklapp-Button steckt in inhalt_links, damit es
+        # beim Einklappen der Spalte als Ganzes sauber ausgeblendet wird.
+        inhalt_links = ctk.CTkFrame(linke_spalte, fg_color="transparent")
+        inhalt_links.pack(fill="both", expand=True)
+
+        titelzeile_links = ctk.CTkFrame(inhalt_links, fg_color="transparent")
+        titelzeile_links.pack(side="top", fill="x", padx=5, pady=(0, 5))
+        ctk.CTkLabel(titelzeile_links, text="Versuche", font=("Arial", 12, "bold")).pack(side="left", padx=5)
+        ctk.CTkLabel(titelzeile_links, text="Verarb.", font=("Arial", 12, "bold")).pack(side="right", padx=5)
+
+        # Button-Leiste zuerst mit side="bottom" packen (siehe Kommentar in
+        # baue_rohdaten_tab), damit sie beim Scrollen nicht verschwindet.
+        button_zeile = ctk.CTkFrame(inhalt_links, fg_color="transparent")
+        button_zeile.pack(side="bottom", fill="x", padx=5, pady=8)
+        ctk.CTkButton(
+            button_zeile,
+            text="Berechnen",
+            fg_color=MUL_TURKIS,
+            command=lambda: self.starte_berechnung(projekt, methode, parent),
+        ).pack(fill="x")
+
+        scroll = ctk.CTkScrollableFrame(inhalt_links, width=240)
+        scroll.pack(padx=0, pady=(0, 5), fill="both", expand=True)
+
+        # Ziehbarer Griff zwischen Versuchsliste und der mittleren Vorschau.
+        griff_links = ctk.CTkFrame(haupt_layout, width=6, fg_color=("gray70", "gray25"), cursor="sb_h_double_arrow")
+        griff_links.pack(side="left", fill="y", padx=(4, 8))
+        self._mache_griff_ziehbar(griff_links, linke_spalte, linke_breite_merker, minimum=90, maximum=650, invertiert=False)
+        self._mache_spalte_einklappbar(
+            links_einklapp_btn, linke_spalte, inhalt_links, linke_breite_merker,
+            eingeklappt_text="◀", ausgeklappt_text="▶", breite_eingeklappt=48,
+        )
+
+        ausgewaehlter_pfad = {"wert": None}
+        zeilen_frames = []
+
+        def waehle_versuch(voller_pfad):
+            ausgewaehlter_pfad["wert"] = voller_pfad
+            for rahmen, pfad in zeilen_frames:
+                rahmen.configure(fg_color=MUL_TURKIS if pfad == voller_pfad else "transparent")
+            zeichne()
+
+        for staub, eintrag, voller_pfad in versuche:
+            zeile = ctk.CTkFrame(scroll, fg_color="transparent", cursor="hand2")
+            zeile.pack(fill="x", pady=2)
+            # Haekchen ZUERST (side="right") packen, damit ihm sein Platz
+            # am rechten Rand fest reserviert wird, BEVOR der Namens-Label
+            # (der bei langen Versuchsnamen viel breiter sein moechte als
+            # verfuegbar) den Rest der Zeile fuellt. Vorher wurde das
+            # Haekchen bei langen Namen aus dem sichtbaren Bereich gedrueckt.
+            verarbeitet = self.ist_versuch_verarbeitet(os.path.dirname(voller_pfad), eintrag, methode)
+            haekchen = ctk.CTkLabel(
+                zeile, text="✓" if verarbeitet else "", font=("Arial", 13, "bold"),
+                text_color="#00ff88", width=30, anchor="center",
+            )
+            haekchen.pack(side="right", padx=5)
+            symbol = "📁" if os.path.isdir(voller_pfad) else "📄"
+            label = ctk.CTkLabel(zeile, text=f"{symbol} [{staub}] {eintrag}", anchor="w")
+            label.pack(side="left", padx=5, fill="x", expand=True)
+            zeilen_frames.append((zeile, voller_pfad))
+            for widget in (zeile, label):
+                widget.bind("<Button-1>", lambda _e, p=voller_pfad: waehle_versuch(p))
+
+        # --- Mitte: 2x2 Live-Vorschau ---
+        mitte = ctk.CTkFrame(haupt_layout, fg_color="transparent")
+        mitte.pack(side="left", fill="both", expand=True, padx=(0, 0))
+
+        fig, achsen_grid = plt.subplots(2, 2, figsize=(9.5, 6.5))
+        achsen = (achsen_grid[0, 0], achsen_grid[0, 1], achsen_grid[1, 0], achsen_grid[1, 1])
+        canvas = FigureCanvasTkAgg(fig, master=mitte)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        def zeichne():
+            pfad = ausgewaehlter_pfad["wert"]
+            if not pfad:
+                return
+            self.zeichne_rohdaten_vorschau_tga(pfad, fig, achsen, canvas, zustand)
+
+        # --- Rechts: Filter-Einstellungen (Filter 1 + Filter 2), komplett
+        # eingebettet (kein Popup). Auesserer Container ist ein einfacher
+        # Frame mit fester (per Griff ziehbarer) Breite; darin liegt eine
+        # eigene Kopfzeile (Titel + Einklapp-Button) und darunter die
+        # eigentliche Scroll-Flaeche mit den Filterblöcken, die beim
+        # Einklappen komplett ausgeblendet wird.
+        rechte_breite_merker = {"breite": 320}
+        griff_rechts = ctk.CTkFrame(haupt_layout, width=6, fg_color=("gray70", "gray25"), cursor="sb_h_double_arrow")
+        griff_rechts.pack(side="left", fill="y", padx=(8, 4))
+
+        rechte_container = ctk.CTkFrame(haupt_layout, fg_color="transparent", width=rechte_breite_merker["breite"])
+        rechte_container.pack(side="left", fill="y")
+        rechte_container.pack_propagate(False)
+
+        rechte_kopfzeile = ctk.CTkFrame(rechte_container, fg_color="transparent")
+        rechte_kopfzeile.pack(side="top", fill="x", padx=(5, 0), pady=(0, 5))
+        rechts_einklapp_btn = ctk.CTkButton(
+            rechte_kopfzeile, text="▶", width=32, fg_color="transparent", border_width=1
+        )
+        rechts_einklapp_btn.pack(side="left")
+
+        rechte_spalte = ctk.CTkScrollableFrame(rechte_container, fg_color="transparent")
+        rechte_spalte.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(
+            rechte_spalte, text="Filter-Einstellungen", font=("Arial", 14, "bold")
+        ).pack(fill="x", padx=10, pady=(0, 10))
+
+        self._mache_griff_ziehbar(
+            griff_rechts, rechte_container, rechte_breite_merker, minimum=140, maximum=650, invertiert=True
+        )
+        self._mache_spalte_einklappbar(
+            rechts_einklapp_btn, rechte_container, rechte_spalte, rechte_breite_merker,
+            eingeklappt_text="▶", ausgeklappt_text="◀", breite_eingeklappt=48,
+        )
+
+        if _FILTER_IMPORT_FEHLER:
+            ctk.CTkLabel(
+                rechte_spalte,
+                text=(
+                    "Filter aus helper/Filter.py konnten nicht geladen werden:\n"
+                    f"{_FILTER_IMPORT_FEHLER}"
+                ),
+                text_color="#ff8080", anchor="w", justify="left", wraplength=270,
+            ).pack(fill="x", padx=10, pady=(0, 10))
+
+        filter_dropdown_werte = TGA_FILTER_OPTIONEN if not _FILTER_IMPORT_FEHLER else ["Kein Filter"]
+        filter_eingabe_widgets = {"f1": {}, "f2": {}}
+        filter_dropdowns = {}
+
+        def baue_filter_block(praefix, ueberschrift_text):
+            ctk.CTkFrame(rechte_spalte, height=2, fg_color=("gray75", "gray30")).pack(
+                fill="x", padx=10, pady=(5, 10)
+            )
+            ctk.CTkLabel(
+                rechte_spalte, text=ueberschrift_text, font=("Arial", 13, "bold"), anchor="w"
+            ).pack(fill="x", padx=10, pady=(0, 5))
+            parameter_frame = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+
+            def zeige_parameter(*_):
+                for kind in parameter_frame.winfo_children():
+                    kind.destroy()
+                parameter_frame.pack(fill="x", padx=0, pady=(0, 5))
+                aktueller_typ = filter_dropdowns[praefix].get()
+                felder_definition = TGA_FILTER_PARAMETER.get(aktueller_typ, [])
+                widgets_fuer_typ = {}
+                for schluessel, label_text, _default in felder_definition:
+                    ctk.CTkLabel(parameter_frame, text=f"{label_text}:", anchor="w").pack(
+                        fill="x", padx=10
+                    )
+                    eingabe = ctk.CTkEntry(parameter_frame)
+                    eingabe.insert(0, str(zustand.get(f"{praefix}_{schluessel}", "")))
+                    eingabe.pack(fill="x", padx=10, pady=(2, 6))
+                    widgets_fuer_typ[schluessel] = eingabe
+                # NUR die Eingabefelder des GERADE sichtbaren Filtertyps
+                # merken (nicht anhaengen!) - alte Eintraege fuer vorher
+                # gewaehlte Typen wurden oben bereits zerstoert
+                # (kind.destroy()) und wuerden in uebernehmen() beim
+                # Auslesen (entry.get()) eine Exception werfen, die den
+                # Rest von uebernehmen() (inkl. Titel-Update) stillschweigend
+                # abbricht. Deshalb hier IMMER ersetzen statt akkumulieren.
+                filter_eingabe_widgets[praefix] = widgets_fuer_typ
+
+                # Live-Vorschau: Titel (und Kurven) sofort an den neu
+                # gewaehlten Filtertyp anpassen, nicht erst nach Klick auf
+                # "Uebernehmen". Die Zahlenparameter selbst werden weiterhin
+                # erst durch "Uebernehmen" persistiert.
+                zustand[f"{praefix}_filter_typ"] = aktueller_typ
+                zeichne()
+
+            dropdown = ctk.CTkOptionMenu(
+                rechte_spalte, values=filter_dropdown_werte, fg_color=MUL_TURKIS,
+                command=zeige_parameter,
+            )
+            aktueller_gespeicherter_typ = zustand.get(f"{praefix}_filter_typ", "Kein Filter")
+            dropdown.set(
+                aktueller_gespeicherter_typ
+                if aktueller_gespeicherter_typ in filter_dropdown_werte else "Kein Filter"
+            )
+            dropdown.pack(fill="x", padx=10, pady=(0, 5))
+            filter_dropdowns[praefix] = dropdown
+            zeige_parameter()
+
+        baue_filter_block("f1", "Filter 1 (Massenkurve dm)")
+        baue_filter_block("f2", "Filter 2 (Reaktionskinetik dm/dt)")
+
+        def als_zahl_oder_none(text):
+            text = text.strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+
+        def uebernehmen():
+            for praefix in ("f1", "f2"):
+                zustand[f"{praefix}_filter_typ"] = filter_dropdowns[praefix].get()
+                for schluessel, entry in filter_eingabe_widgets[praefix].items():
+                    wert = als_zahl_oder_none(entry.get())
+                    if wert is not None:
+                        zustand[f"{praefix}_{schluessel}"] = wert
+            self.speichere_rohdaten_filter_einstellungen(projekt, methode, zustand)
+            zeichne()
+
+        ctk.CTkButton(
+            rechte_spalte, text="Übernehmen", fg_color=MUL_TURKIS, command=uebernehmen
+        ).pack(fill="x", padx=10, pady=(10, 15))
+
+        # --- Ersten Versuch automatisch auswaehlen ---
+        waehle_versuch(versuche[0][2])
 
     # ------------------------------------------------------------------
     # TAB: ERGEBNISSE (Höhenverlauf + Form pro Versuch, aus processed_data)
@@ -2162,40 +2766,15 @@ class LaborApp(ctk.CTk):
         Gibt None zurück bei "Kein Filter", fehlendem Import (siehe
         _FILTER_IMPORT_FEHLER) oder ungültigen Parametern - die
         Reaktionskinetik wird dann unverändert (ungefiltert) gezeichnet.
+
+        Duennes Wrapper um _baue_filter_objekt() (siehe dort) - hier bleiben
+        die Parameter-Schluessel unpraefigiert (wie im Ergebnisse-Tab
+        gespeichert), waehrend die Rohdaten-Vorschau (Filter 1 / Filter 2)
+        praefigierte Schluessel verwendet (siehe
+        _rohdaten_filter_parameter_ansicht).
         """
         typ = zustand.get("filter_typ", "Kein Filter")
-        if typ == "Kein Filter" or ButterworthFilter is None:
-            return None
-        try:
-            if typ == "Butterworth":
-                return ButterworthFilter(
-                    cutoff=float(zustand.get("filter_butter_cutoff", 0.05)),
-                    order=int(zustand.get("filter_butter_order", 2)),
-                    time_unit="sec",
-                )
-            if typ == "Savitzky-Golay":
-                fenster = int(zustand.get("filter_savgol_window", 15))
-                if fenster % 2 == 0:
-                    fenster += 1
-                return SavitzkyGolayFilter(
-                    window_length=fenster,
-                    polyorder=int(zustand.get("filter_savgol_polyorder", 2)),
-                )
-            if typ == "Exponentielles gleitendes Mittel":
-                return ExponentialMovingAverage(alpha=float(zustand.get("filter_ema_alpha", 0.3)))
-            if typ == "Median":
-                kernel = int(zustand.get("filter_median_kernel", 9))
-                if kernel % 2 == 0:
-                    kernel += 1
-                return MedianFilter(kernel_size=kernel)
-            if typ == "Gaussian":
-                return GaussianFilter(sigma=float(zustand.get("filter_gauss_sigma", 1.0)))
-            if typ == "Gleitender Mittelwert":
-                return RollingAverage(sampling_rate=int(zustand.get("filter_rollavg_fenster", 10)))
-        except Exception as e:
-            print(f"[TGA-Kinetik-Filter] Ungültige Einstellungen ({typ}): {e}")
-            return None
-        return None
+        return self._baue_filter_objekt(typ, zustand)
 
     def zeichne_ergebnis_plot_tga(self, eintrag_info, fig, ax_masse, ax_kinetik, canvas, zustand):
         """

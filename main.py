@@ -1,5 +1,6 @@
 import customtkinter as ctk
 import os
+import re
 import sys
 import subprocess
 import threading
@@ -17,16 +18,116 @@ BASIS_PFAD = r"C:\Users\aaron\Nextcloud\Documents\work\H2Lab_Evaluation_System"
 MUL_TURKIS = "#008c96"
 MUL_DUNKEL = "#0a2a2d"
 
-# Pfad zu EMI_calculation.py (die echte Berechnung von raw_data zu processed_data,
-# via HSMTools). Wird als eigener Subprozess gestartet, NICHT im main.py-Prozess
-# importiert - so bleibt die GUI responsiv und fehlende Pakete/Abstürze im
-# Berechnungs-Skript reißen die App nicht mit runter.
-# Wenn None, wird automatisch gesucht:
+# Pfad zu EMI_calculation.py/TGA_calculation.py (die echten Berechnungen von
+# raw_data zu processed_data). Wird als eigener Subprozess gestartet, NICHT im
+# main.py-Prozess importiert - so bleibt die GUI responsiv und fehlende
+# Pakete/Abstürze im Berechnungs-Skript reißen die App nicht mit runter.
+# Wenn ein Eintrag None ist, wird automatisch gesucht:
 #   1) neben dieser main.py
-#   2) unter <main.py-Ordner>/EMI/data_preparation/EMI_calculation.py
-# Falls das Skript wo ganz anders liegt, hier den vollen Pfad eintragen, z.B.:
-# EMI_CALCULATION_SCRIPT_PFAD = r"C:\Users\aaron\...\EMI\data_preparation\EMI_calculation.py"
-EMI_CALCULATION_SCRIPT_PFAD = None
+#   2) unter <main.py-Ordner>/<Methode>/data_preparation/<Methode>_calculation.py
+# Falls ein Skript wo ganz anders liegt, hier den vollen Pfad eintragen, z.B.:
+# BERECHNUNGS_SKRIPT_PFADE["EMI"] = r"C:\Users\aaron\...\EMI\data_preparation\EMI_calculation.py"
+BERECHNUNGS_SKRIPT_PFADE = {
+    "EMI": None,
+    "TGA": None,
+}
+# Methoden, für die es bereits eine echte raw_data -> processed_data
+# Berechnung gibt (Subprozess-Aufruf). Alle anderen METHODEN (s.u.) zeigen
+# weiterhin nur den Platzhalter-"Berechnen"-Check.
+BERECHNUNGS_FAEHIGE_METHODEN = ("EMI", "TGA")
+
+# --- Filter-Klassen aus helper/Filter.py (fuer die Glaettung der
+# Reaktionskinetik im Ergebnisse-Tab TGA, siehe Settings-Dialog dort) ---
+# Der "helper"-Ordner kann je nach Rechner/Aufbau an unterschiedlichen
+# Stellen relativ zu main.py liegen. Es werden daher mehrere Kandidaten
+# probiert UND jeder Kandidat wird konkret auf eine vorhandene Filter.py
+# geprueft (nicht nur auf den blossen Ordnernamen "helper") - so schlaegt
+# der Import auch dann nicht fehl, wenn irgendwo ein "helper"-Ordner OHNE
+# Filter.py existiert (z.B. eine unvollstaendige Kopie).
+_MAIN_DIR = os.path.dirname(os.path.abspath(__file__))
+_HELPER_KANDIDATEN = [
+    _MAIN_DIR,
+    os.path.dirname(_MAIN_DIR),
+    os.path.dirname(os.path.dirname(_MAIN_DIR)),
+    BASIS_PFAD,
+    os.path.dirname(BASIS_PFAD) if BASIS_PFAD else None,
+]
+_HELPER_SUCHPROTOKOLL = []  # fuer Diagnose im Settings-Dialog, falls Import scheitert
+_HELPER_GEFUNDEN = None
+
+for _kandidat in _HELPER_KANDIDATEN:
+    if not _kandidat:
+        continue
+    _helper_ordner = os.path.join(_kandidat, "helper")
+    _filter_datei = os.path.join(_helper_ordner, "Filter.py")
+    if os.path.isfile(_filter_datei):
+        _HELPER_SUCHPROTOKOLL.append(f"OK    {_filter_datei}")
+        if _HELPER_GEFUNDEN is None:
+            _HELPER_GEFUNDEN = _kandidat
+            if _kandidat not in sys.path:
+                sys.path.insert(0, _kandidat)
+    elif os.path.isdir(_helper_ordner):
+        _HELPER_SUCHPROTOKOLL.append(f"FEHLT Filter.py in {_helper_ordner} (Ordner existiert, Datei nicht)")
+    else:
+        _HELPER_SUCHPROTOKOLL.append(f"FEHLT {_helper_ordner} (Ordner existiert nicht)")
+
+try:
+    if _HELPER_GEFUNDEN is None:
+        raise ImportError(
+            "Kein 'helper'-Ordner mit Filter.py gefunden. Gepruefte Orte:\n"
+            + "\n".join(_HELPER_SUCHPROTOKOLL)
+        )
+    from helper.Filter import (
+        ButterworthFilter,
+        SavitzkyGolayFilter,
+        ExponentialMovingAverage,
+        MedianFilter,
+        GaussianFilter,
+        RollingAverage,
+    )
+    _FILTER_IMPORT_FEHLER = None
+except Exception as _filter_exc:
+    ButterworthFilter = SavitzkyGolayFilter = ExponentialMovingAverage = None
+    MedianFilter = GaussianFilter = RollingAverage = None
+    _FILTER_IMPORT_FEHLER = str(_filter_exc)
+
+# Auswahl-Optionen fuer den Kinetik-Filter (rechtes Diagramm) im
+# Settings-Dialog des TGA-Ergebnisse-Tabs.
+TGA_FILTER_OPTIONEN = [
+    "Kein Filter",
+    "Butterworth",
+    "Savitzky-Golay",
+    "Exponentielles gleitendes Mittel",
+    "Median",
+    "Gaussian",
+    "Gleitender Mittelwert",
+]
+
+# Je Filtertyp: Liste von (zustand-Schluessel, Anzeige-Label, Default-Text).
+# Wird im Settings-Dialog dynamisch passend zum gewaehlten Filtertyp
+# eingeblendet (siehe oeffne_settings/_baue_filter_parameter_felder).
+TGA_FILTER_PARAMETER = {
+    "Butterworth": [
+        ("filter_butter_cutoff", "Cutoff (0 - 0.4, kleiner = staerker glaetten)", "0.05"),
+        ("filter_butter_order", "Ordnung", "2"),
+    ],
+    "Savitzky-Golay": [
+        ("filter_savgol_window", "Fensterlaenge (ungerade)", "15"),
+        ("filter_savgol_polyorder", "Polynomgrad", "2"),
+    ],
+    "Exponentielles gleitendes Mittel": [
+        ("filter_ema_alpha", "Alpha (0 - 1, kleiner = staerker glaetten)", "0.3"),
+    ],
+    "Median": [
+        ("filter_median_kernel", "Fenstergroesse (ungerade)", "9"),
+    ],
+    "Gaussian": [
+        ("filter_gauss_sigma", "Sigma", "1.0"),
+    ],
+    "Gleitender Mittelwert": [
+        ("filter_rollavg_fenster", "Fenstergroesse (Punkte)", "10"),
+    ],
+}
 
 # Optional: anderer Python-Interpreter für die EMI-Berechnung (falls HSMTools
 # in einer eigenen venv installiert ist, nicht in der venv der GUI-App).
@@ -306,6 +407,108 @@ class LaborApp(ctk.CTk):
 
         return None
 
+    def _tga_versuchsname_fuer_sheet(self, eintrag):
+        """
+        TGA-Rohdateien heißen '<Folgenummer>_<Name>.txt' (z.B. '1986_RT1.txt'),
+        wobei '<Name>' der manuell am Gerät eingegebene Versuchsname ist - das
+        ist vermutlich auch der Wert in der "Messung"-Spalte im Sheet (nicht
+        die Folgenummer). Muss ident zur gleichnamigen Logik in
+        TGA_calculation.py sein (_versuchsname_aus_dateiname).
+        """
+        stem = os.path.splitext(eintrag)[0]
+        match = re.match(r"^\d+_(.+)$", stem)
+        return match.group(1) if match else stem
+
+    def hole_tga_parameter_fuer_versuch(self, versuch_name):
+        """
+        TGA-Gegenstück zu hole_emi_parameter_fuer_versuch: sucht im Sheet die
+        Zeile zur "Messung"-ID und liest:
+          - Material/Kommentar (allgemeiner Metadaten-Bereich, VOR "Messung")
+          - CaO-/Kalk-Zugabe (für die interne EAFD-Basis-Umrechnung, siehe
+            _tga_auf_eafd_basis - bleibt intern, wird nicht extra im
+            Metadaten-Tab angezeigt)
+          - TGA-spezifische Settings-Spalten NACH "Messung" (TGA-ID, Gas,
+            Tmax, Operator, mass_loss_scale_%) - analog zu Temperaturverlauf/
+            Gas/Durchfluss bei EMI, damit keine gleichnamige Spalte aus
+            einem anderen Methoden-Block fälschlich gefunden wird.
+        Alle Spaltennamen werden tolerant gesucht (mehrere Schreibweisen je
+        Zielspalte) - falls euer Sheet anders beschriftet ist, hier die
+        passende Variante in den jeweiligen 'kandidaten'-Tupeln ergänzen.
+        Gibt ein Dict zurück, oder None, wenn keine passende Zeile gefunden
+        wurde.
+        """
+        header_index, header = self.finde_header_zeile("Messung")
+        if header is None:
+            return None
+
+        spalten_index = {}
+        for i, spalte in enumerate(header):
+            if str(spalte).strip().lower() == "messung":
+                spalten_index["Messung"] = i
+                break
+        if "Messung" not in spalten_index:
+            return None
+
+        for name in ("material", "comment (lime addition)"):
+            for i, spalte in enumerate(header):
+                if str(spalte).strip().lower() == name:
+                    spalten_index[name] = i
+                    break
+
+        # CaO-/Kalk-Zugabe-Spalte tolerant suchen (Name im Sheet evtl. anders -
+        # bei Bedarf hier ergänzen).
+        cao_kandidaten = ("cao", "cao %", "cao [%]", "cao-zugabe", "lime", "lime addition", "lime m-%", "lime %")
+        for i, spalte in enumerate(header):
+            if str(spalte).strip().lower() in cao_kandidaten:
+                spalten_index["cao"] = i
+                break
+
+        # TGA-spezifische Settings-Spalten NUR in den Spalten NACH "Messung"
+        # suchen (siehe Docstring oben) - je Zielspalte mehrere tolerante
+        # Namensvarianten.
+        m_idx = spalten_index["Messung"]
+        tga_settings_kandidaten = {
+            "tga_id": ("tga id", "tga-id", "tga_id", "tgaid"),
+            "gas": ("gas",),
+            "tmax": ("tmax", "t max", "t_max", "t-max"),
+            "operator": ("operator", "bediener"),
+            "mass_loss_scale_pct": (
+                "mass_loss_scale_%", "mass loss scale %", "mass loss scale",
+                "massloss scale %", "mass_loss_scale",
+            ),
+        }
+        for ziel_name, kandidaten in tga_settings_kandidaten.items():
+            for i in range(m_idx + 1, len(header)):
+                if str(header[i]).strip().lower() in kandidaten:
+                    spalten_index[ziel_name] = i
+                    break
+
+        ziel_normalisiert = self.normalisiere_id(versuch_name)
+        for zeile in self.aktuelle_sheet_daten[header_index + 1:]:
+            if len(zeile) > m_idx and self.normalisiere_id(zeile[m_idx]) == ziel_normalisiert:
+                def _wert(spalten_name):
+                    idx = spalten_index.get(spalten_name)
+                    return zeile[idx] if idx is not None and len(zeile) > idx else ""
+
+                cao_text = str(_wert("cao")).strip().replace(",", ".").replace("%", "")
+                try:
+                    cao_pct = float(cao_text) if cao_text else None
+                except ValueError:
+                    cao_pct = None
+
+                return {
+                    "material": _wert("material"),
+                    "kommentar": _wert("comment (lime addition)"),
+                    "cao_pct": cao_pct,
+                    "tga_id": _wert("tga_id"),
+                    "gas": _wert("gas"),
+                    "tmax": _wert("tmax"),
+                    "operator": _wert("operator"),
+                    "mass_loss_scale_pct": _wert("mass_loss_scale_pct"),
+                }
+
+        return None
+
     def on_projekt_wechsel(self, projekt_name):
         """Wird aufgerufen, sobald im Dropdown ein anderes Projekt gewählt wird."""
         self._status(f"Projekt '{projekt_name}' wird geladen ...", "#ffff00")
@@ -504,6 +707,16 @@ class LaborApp(ctk.CTk):
     # DETAILANSICHT EINER METHODE
     # ------------------------------------------------------------------
     def oeffne_methoden_detail(self, projekt, methode):
+        # Ordnerstruktur sicherstellen: falls für diese Methode NOCH KEIN
+        # raw_data-Ordner existiert (weder alte "raw_data"- noch neue
+        # "data/raw_data"-Struktur), legen wir die neue Standardstruktur
+        # <Methode>/data/raw_data + data/processed_data + outputs/diagramm
+        # an. Existiert bereits irgendeine Struktur, wird NICHTS angefasst -
+        # das bestehende EMI-Setup bleibt unverändert. Gilt gleichermaßen
+        # für EMI, TGA und zukünftige Methoden, da "methode" generisch ist.
+        if not self.finde_raw_data_ordner(projekt, methode):
+            self.erstelle_versuchs_struktur(projekt, "", methode)
+
         top = ctk.CTkToplevel(self)
         top.title(f"{projekt} – {methode}")
 
@@ -621,13 +834,13 @@ class LaborApp(ctk.CTk):
     def ist_versuch_verarbeitet(self, raw_data_ordner, eintrag, methode=None):
         """
         Prüft, ob ein Versuch bereits verarbeitet wurde.
-        Bei EMI: sucht die von EMI_calculation.py erzeugte
+        Bei EMI/TGA: sucht die vom jeweiligen *_calculation.py-Skript erzeugte
         "<sanitierter_name>_results.parquet"-Datei in processed_data.
         Bei anderen Methoden (noch kein Berechnungs-Skript vorhanden):
         Platzhalter-Check, ob irgendwas mit demselben Namen existiert.
         """
         processed_ordner = self.processed_data_ordner_fuer(raw_data_ordner)
-        if methode == "EMI":
+        if methode in BERECHNUNGS_FAEHIGE_METHODEN:
             versuch_name = os.path.splitext(eintrag)[0]
             ziel = os.path.join(processed_ordner, f"{self._sanitiere_versuchsnamen(versuch_name)}_results.parquet")
         else:
@@ -635,49 +848,51 @@ class LaborApp(ctk.CTk):
         return os.path.exists(ziel)
 
     # ------------------------------------------------------------------
-    # EMI-Berechnung (echtes Skript: EMI_calculation.py / HSMTools)
+    # Berechnung (echte Skripte: EMI_calculation.py / TGA_calculation.py)
     # Läuft bewusst NICHT im main.py-Prozess: wird als eigener Python-
     # Subprozess gestartet (wie in der .md als CLI-Aufruf beschrieben), in
     # einem Hintergrund-Thread, damit die GUI währenddessen nicht einfriert
     # und Abstürze/fehlende Pakete im Berechnungs-Skript die App nicht
     # mitreißen.
     # ------------------------------------------------------------------
-    def finde_emi_calculation_skript(self):
+    def finde_berechnung_skript(self, methode):
         """
-        Sucht EMI_calculation.py in dieser Reihenfolge:
-          1) EMI_CALCULATION_SCRIPT_PFAD (falls gesetzt)
+        Sucht "<Methode>_calculation.py" in dieser Reihenfolge:
+          1) BERECHNUNGS_SKRIPT_PFADE[methode] (falls gesetzt)
           2) neben main.py
-          3) <main.py-Ordner>/EMI/data_preparation/EMI_calculation.py
+          3) <main.py-Ordner>/<Methode>/data_preparation/<Methode>_calculation.py
         Gibt den Pfad zurück oder wirft FileNotFoundError.
         """
+        skript_name = f"{methode}_calculation.py"
         skript_ordner = os.path.dirname(os.path.abspath(__file__))
         kandidaten = []
-        if EMI_CALCULATION_SCRIPT_PFAD:
-            kandidaten.append(EMI_CALCULATION_SCRIPT_PFAD)
-        kandidaten.append(os.path.join(skript_ordner, "EMI_calculation.py"))
-        kandidaten.append(os.path.join(skript_ordner, "EMI", "data_preparation", "EMI_calculation.py"))
+        pfad_override = BERECHNUNGS_SKRIPT_PFADE.get(methode)
+        if pfad_override:
+            kandidaten.append(pfad_override)
+        kandidaten.append(os.path.join(skript_ordner, skript_name))
+        kandidaten.append(os.path.join(skript_ordner, methode, "data_preparation", skript_name))
 
         gefundener_pfad = next((p for p in kandidaten if p and os.path.isfile(p)), None)
         if not gefundener_pfad:
             raise FileNotFoundError(
-                "EMI_calculation.py nicht gefunden. Gesucht an:\n"
+                f"{skript_name} nicht gefunden. Gesucht an:\n"
                 + "\n".join(kandidaten)
-                + "\n\nEntweder das Skript dort ablegen oder EMI_CALCULATION_SCRIPT_PFAD "
+                + f"\n\nEntweder das Skript dort ablegen oder BERECHNUNGS_SKRIPT_PFADE['{methode}'] "
                 "am Kopf von main.py auf den vollen Pfad setzen."
             )
         return gefundener_pfad
 
-    def fuehre_emi_berechnung_aus(self, unverarbeitete_versuche, log_zeile_callback):
+    def fuehre_berechnung_aus(self, methode, unverarbeitete_versuche, log_zeile_callback):
         """
-        Startet EMI_calculation.py als eigenen Python-Subprozess (CLI, wie in
-        der .md dokumentiert) - NICHT im main.py-Prozess. Läuft in DIESEM
-        Aufruf synchron (blockierend), wird daher von starte_berechnung()
-        immer in einem Hintergrund-Thread aufgerufen, nie direkt im GUI-Thread.
+        Startet "<Methode>_calculation.py" als eigenen Python-Subprozess (CLI) -
+        NICHT im main.py-Prozess. Läuft in DIESEM Aufruf synchron
+        (blockierend), wird daher von starte_berechnung() immer in einem
+        Hintergrund-Thread aufgerufen, nie direkt im GUI-Thread.
         Ruft NUR für die übergebenen, noch unverarbeiteten Versuche auf
         (--samples, kein --force) - bestehende processed_data-Dateien
         anderer Versuche bleiben unangetastet. Gruppiert nach raw_data-
         Ordner, da das Skript einen ganzen Ordner voller Sample-Unterordner
-        pro Aufruf erwartet.
+        bzw. Rohdateien pro Aufruf erwartet.
 
         log_zeile_callback(text) wird für JEDE Ausgabezeile des Subprozesses
         sofort aufgerufen (live), damit man im UI sieht, dass/was gerade
@@ -686,7 +901,7 @@ class LaborApp(ctk.CTk):
         Gibt None bei Erfolg zurück, sonst einen Fehlertext.
         """
         try:
-            skript_pfad = self.finde_emi_calculation_skript()
+            skript_pfad = self.finde_berechnung_skript(methode)
         except Exception as e:
             return str(e)
 
@@ -720,7 +935,7 @@ class LaborApp(ctk.CTk):
                     bufsize=1,  # Zeilenweise gepuffert -> Zeilen kommen live an, nicht erst am Ende
                 )
             except Exception as e:
-                return f"Konnte EMI_calculation.py nicht starten ('{raw_data_ordner}'):\n{e}"
+                return f"Konnte {methode}_calculation.py nicht starten ('{raw_data_ordner}'):\n{e}"
 
             gesammelte_ausgabe = []
             for zeile in prozess.stdout:
@@ -731,7 +946,7 @@ class LaborApp(ctk.CTk):
             returncode = prozess.wait(timeout=3600)
             if returncode != 0:
                 ausgabe = "\n".join(gesammelte_ausgabe[-40:]) or "(keine Ausgabe)"
-                return f"EMI_calculation.py meldete einen Fehler (Exit-Code {returncode}) in '{raw_data_ordner}':\n\n{ausgabe}"
+                return f"{methode}_calculation.py meldete einen Fehler (Exit-Code {returncode}) in '{raw_data_ordner}':\n\n{ausgabe}"
 
         return None
 
@@ -754,8 +969,8 @@ class LaborApp(ctk.CTk):
 
     def starte_berechnung(self, projekt, methode, rohdaten_frame):
         """
-        'Berechnen'-Button. Bei EMI: startet die echte Berechnung
-        (EMI_calculation.py/HSMTools) als eigenen Subprozess in einem
+        'Berechnen'-Button. Bei EMI/TGA: startet die echte Berechnung
+        (<Methode>_calculation.py) als eigenen Subprozess in einem
         Hintergrund-Thread, mit Live-Log-Fenster - die GUI bleibt
         währenddessen bedienbar und man SIEHT, dass/was gerade passiert.
         Bei anderen Methoden (noch kein Skript vorhanden): reiner
@@ -770,7 +985,7 @@ class LaborApp(ctk.CTk):
             if not self.ist_versuch_verarbeitet(os.path.dirname(voller_pfad), eintrag, methode)
         ]
 
-        if methode != "EMI":
+        if methode not in BERECHNUNGS_FAEHIGE_METHODEN:
             anzahl_verarbeitet = anzahl_gesamt - len(unverarbeitete)
             self._status(
                 f"Geprüft: {anzahl_verarbeitet}/{anzahl_gesamt} Versuche bereits in processed_data.",
@@ -782,15 +997,15 @@ class LaborApp(ctk.CTk):
             return
 
         if not unverarbeitete:
-            self._status("Alle EMI-Versuche bereits in processed_data vorhanden.", "#00ff88")
+            self._status(f"Alle {methode}-Versuche bereits in processed_data vorhanden.", "#00ff88")
             for widget in rohdaten_frame.winfo_children():
                 widget.destroy()
             self.baue_rohdaten_tab(rohdaten_frame, projekt, methode)
             return
 
-        self._status(f"Berechne {len(unverarbeitete)} EMI-Versuch(e) im Hintergrund ...", "#ffff00")
+        self._status(f"Berechne {len(unverarbeitete)} {methode}-Versuch(e) im Hintergrund ...", "#ffff00")
         log_fenster, log_textbox = self.oeffne_berechnungs_log_fenster(
-            f"EMI-Berechnung läuft: {projekt} ({len(unverarbeitete)} Versuch(e))"
+            f"{methode}-Berechnung läuft: {projekt} ({len(unverarbeitete)} Versuch(e))"
         )
 
         def log_anhaengen(text):
@@ -814,14 +1029,14 @@ class LaborApp(ctk.CTk):
                 # Kommt aus dem Hintergrund-Thread -> Textbox-Update in den GUI-Thread verlagern.
                 self.after(0, lambda z=zeile: log_anhaengen(z))
 
-            fehler = self.fuehre_emi_berechnung_aus(unverarbeitete, live_zeile)
+            fehler = self.fuehre_berechnung_aus(methode, unverarbeitete, live_zeile)
             self.after(0, lambda: fertig_im_gui_thread(fehler))
 
         def fertig_im_gui_thread(fehler):
             if fehler:
                 log_anhaengen(f"\n--- FEHLER ---\n{fehler}")
-                messagebox.showerror("EMI-Berechnung fehlgeschlagen", fehler)
-                self._status("EMI-Berechnung fehlgeschlagen (siehe Fehlermeldung/Log).", "#ff5555")
+                messagebox.showerror(f"{methode}-Berechnung fehlgeschlagen", fehler)
+                self._status(f"{methode}-Berechnung fehlgeschlagen (siehe Fehlermeldung/Log).", "#ff5555")
             else:
                 jetzt_verarbeitet = anzahl_gesamt - sum(
                     1 for _s, e, p in versuche
@@ -829,7 +1044,7 @@ class LaborApp(ctk.CTk):
                 )
                 log_anhaengen(f"\n--- FERTIG ({jetzt_verarbeitet}/{anzahl_gesamt} verarbeitet) ---")
                 self._status(
-                    f"EMI-Berechnung abgeschlossen ({jetzt_verarbeitet}/{anzahl_gesamt} verarbeitet).",
+                    f"{methode}-Berechnung abgeschlossen ({jetzt_verarbeitet}/{anzahl_gesamt} verarbeitet).",
                     "#00ff88",
                 )
             # Auch hier: Log-Fenster und Rohdaten-Frame können vom User
@@ -869,6 +1084,11 @@ class LaborApp(ctk.CTk):
 
         if methode == "EMI":
             spalten = ["Versuch", "Material", "Kommentar (Lime addition)", "Temperaturverlauf", "Gas", "Durchfluss"]
+        elif methode == "TGA":
+            spalten = [
+                "Versuch", "Material", "Kommentar (Lime addition)", "TGA ID",
+                "Gas", "Tmax", "Operator", "Mass Loss Scale [%]", "CaO [%]",
+            ]
         else:
             spalten = ["Versuch", "Info"]
 
@@ -897,6 +1117,23 @@ class LaborApp(ctk.CTk):
                     ]
                 else:
                     werte = [versuch_name, "-", "-", "-", "-", "-"]
+            elif methode == "TGA":
+                sheet_name = self._tga_versuchsname_fuer_sheet(eintrag)
+                tga_parameter = self.hole_tga_parameter_fuer_versuch(sheet_name)
+                if tga_parameter:
+                    werte = [
+                        versuch_name,
+                        tga_parameter["material"],
+                        tga_parameter["kommentar"],
+                        tga_parameter["tga_id"],
+                        tga_parameter["gas"],
+                        tga_parameter["tmax"],
+                        tga_parameter["operator"],
+                        tga_parameter["mass_loss_scale_pct"],
+                        tga_parameter["cao_pct"] if tga_parameter["cao_pct"] is not None else "-",
+                    ]
+                else:
+                    werte = [versuch_name, "-", "-", "-", "-", "-", "-", "-", "-"]
             else:
                 werte = [versuch_name, "Für diese Methode noch keine Sheet-Anbindung."]
 
@@ -1012,9 +1249,13 @@ class LaborApp(ctk.CTk):
         nicht das ganze Widget neu aufgebaut. Das verhindert den sichtbaren
         "Sprung"/das Ruckeln beim Umschalten zwischen Versuchen.
         """
+        if methode == "TGA":
+            self.baue_ergebnisse_tab_tga(parent, projekt, methode)
+            return
+
         if methode != "EMI":
             ctk.CTkLabel(
-                parent, text="Ergebnisdarstellung ist aktuell nur für EMI verfügbar."
+                parent, text="Ergebnisdarstellung ist aktuell nur für EMI und TGA verfügbar."
             ).pack(pady=20)
             return
 
@@ -1457,6 +1698,7 @@ class LaborApp(ctk.CTk):
         ax_hoehe.set_ylim(bottom=zustand["y_min"], top=zustand["y_max"])
         ax_hoehe.grid(True, alpha=0.3)
 
+
         # --- Form: kompletter Schmelzverlauf, alle Konturen übereinander,
         # nach Temperatur eingefärbt (wie bei den bunten Referenzplots).
         # Zeigt nur Konturen im selben X-Achsen-Bereich wie der Höhenverlauf
@@ -1536,6 +1778,519 @@ class LaborApp(ctk.CTk):
         canvas.draw_idle()
 
     # ------------------------------------------------------------------
+    # TAB: ERGEBNISSE (TGA) - Relative Masse + Reaktionskinetik pro Versuch
+    # ------------------------------------------------------------------
+    def baue_ergebnisse_tab_tga(self, parent, projekt, methode):
+        """
+        TGA-Gegenstück zu baue_ergebnisse_tab (EMI): zeigt pro (bereits
+        verarbeitetem) Versuch links die Relative Masse und rechts die
+        Reaktionskinetik, jeweils über der Temperatur, aus der zugehörigen
+        <versuch>_results.parquet-Datei (erzeugt von TGA_calculation.py).
+
+        Ist die CaO-Zugabe für den Versuch im Google Sheet hinterlegt (siehe
+        hole_tga_parameter_fuer_versuch), werden beide Kurven automatisch auf
+        "% of EAFD" umgerechnet (CaO-Anteil rausgerechnet, siehe
+        _tga_auf_eafd_basis) - genau wie in euren Referenzdiagrammen. Ohne
+        CaO-Wert bleibt es bei "% of mixture" (Rohwert aus der Waage).
+
+        Gleiches Layout/Bedienkonzept wie bei EMI: Seitenleiste mit
+        Versuchsauswahl + Settings-Button (Titel/Achsenbeschriftungen/
+        -bereiche editierbar, dauerhaft gespeichert), Download-Buttons pro
+        Diagrammausschnitt.
+        """
+        versuche = self.liste_versuche(projekt, methode)
+        verarbeitete_versuche = [
+            (staub, eintrag, voller_pfad)
+            for staub, eintrag, voller_pfad in versuche
+            if self.ist_versuch_verarbeitet(os.path.dirname(voller_pfad), eintrag, methode)
+        ]
+
+        if not verarbeitete_versuche:
+            ctk.CTkLabel(
+                parent, text="Noch keine verarbeiteten Versuche (siehe Rohdaten-Tab -> Berechnen)."
+            ).pack(pady=20)
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        except ImportError:
+            ctk.CTkLabel(
+                parent,
+                text="matplotlib ist nicht installiert - 'pip install matplotlib' im GUI-Environment nötig.",
+                wraplength=560,
+            ).pack(pady=20)
+            return
+
+        zustand_standard = {
+            "versuch_name": None,
+            "title_masse": "Relative Mass",
+            "label_x": "Temperature [°C]",
+            "label_y_masse": "Relative Mass\n[% of EAFD]",
+            "x_min": None,
+            "x_max": None,
+            "y_min_masse": None,
+            "y_max_masse": None,
+            "title_kinetik": "Reaction Kinetics",
+            "label_y_kinetik": "Reaction Kinetics\n[%/min of EAFD]",
+            "y_min_kinetik": None,
+            "y_max_kinetik": None,
+            # --- Filter fuer die Reaktionskinetik (rechtes Diagramm) ---
+            "filter_typ": "Butterworth",
+            "filter_butter_cutoff": 0.05,
+            "filter_butter_order": 2,
+            "filter_savgol_window": 15,
+            "filter_savgol_polyorder": 2,
+            "filter_ema_alpha": 0.3,
+            "filter_median_kernel": 9,
+            "filter_gauss_sigma": 1.0,
+            "filter_rollavg_fenster": 10,
+        }
+        zustand = self.lade_diagramm_einstellungen(projekt, methode, zustand_standard)
+
+        # --- Anzeige-Text (Material – Kommentar) <-> tatsächlicher Versuchsname ---
+        anzeige_zu_name = {}
+        anzeige_werte = []
+        for _s, eintrag, _p in verarbeitete_versuche:
+            versuch_name = os.path.splitext(eintrag)[0]
+            sheet_name = self._tga_versuchsname_fuer_sheet(eintrag)
+            parameter = self.hole_tga_parameter_fuer_versuch(sheet_name)
+            if parameter and (parameter.get("material") or parameter.get("kommentar")):
+                material = parameter.get("material") or "-"
+                kommentar = parameter.get("kommentar") or "-"
+                anzeige = f"{material} – {kommentar}"
+            else:
+                anzeige = versuch_name
+            if anzeige in anzeige_zu_name:
+                anzeige = f"{anzeige} [{versuch_name}]"
+            anzeige_zu_name[anzeige] = versuch_name
+            anzeige_werte.append(anzeige)
+
+        # --- Layout: Seitenleiste links, Diagramme rechts (wie bei EMI) ---
+        haupt_layout = ctk.CTkFrame(parent, fg_color="transparent")
+        haupt_layout.pack(fill="both", expand=True, padx=10, pady=10)
+
+        seitenleiste = ctk.CTkFrame(haupt_layout, fg_color="transparent", width=170)
+        seitenleiste.pack(side="left", fill="y", padx=(0, 15))
+        seitenleiste.pack_propagate(False)
+
+        ctk.CTkLabel(seitenleiste, text="Versuch:", font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 5))
+
+        plot_frame = ctk.CTkFrame(haupt_layout, fg_color="transparent")
+        plot_frame.pack(side="left", fill="both", expand=True)
+
+        button_leiste = ctk.CTkFrame(plot_frame, fg_color="transparent")
+        button_leiste.pack(side="top", fill="x")
+        button_leiste.grid_columnconfigure(0, weight=1)
+        button_leiste.grid_columnconfigure(1, weight=1)
+
+        fig, (ax_masse, ax_kinetik) = plt.subplots(1, 2, figsize=(10, 4.6))
+        canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+        def zeichne():
+            versuch_name = zustand["versuch_name"]
+            if not versuch_name:
+                return
+            eintrag_info = next(
+                (s, e, p) for s, e, p in verarbeitete_versuche
+                if os.path.splitext(e)[0] == versuch_name
+            )
+            zustand["_aktueller_raw_data_ordner"] = os.path.dirname(eintrag_info[2])
+            self.zeichne_ergebnis_plot_tga(eintrag_info, fig, ax_masse, ax_kinetik, canvas, zustand)
+
+        def speichere_diagrammausschnitt(ax, dateiname_teil):
+            versuch_name = zustand["versuch_name"]
+            raw_data_ordner = zustand.get("_aktueller_raw_data_ordner")
+            if not versuch_name or not raw_data_ordner:
+                return
+            try:
+                ziel_ordner = self.diagramm_ordner_fuer(raw_data_ordner)
+                zeitstempel = datetime.now().strftime("%Y%m%d_%H%M%S")
+                dateiname = f"{self._sanitiere_versuchsnamen(versuch_name)}_{dateiname_teil}_{zeitstempel}.png"
+                ziel_pfad = os.path.join(ziel_ordner, dateiname)
+                canvas.draw()
+                bbox = ax.get_tightbbox(canvas.get_renderer()).transformed(fig.dpi_scale_trans.inverted())
+                fig.savefig(ziel_pfad, dpi=200, bbox_inches=bbox)
+                self._status(f"Diagramm gespeichert: {ziel_pfad}", "#00ff88")
+            except Exception as e:
+                messagebox.showerror("Download-Fehler", f"Konnte Diagramm nicht speichern:\n{e}")
+
+        def lade_masse_herunter():
+            speichere_diagrammausschnitt(ax_masse, "relative_masse")
+
+        def lade_kinetik_herunter():
+            speichere_diagrammausschnitt(ax_kinetik, "reaktionskinetik")
+
+        download_button_links = ctk.CTkButton(
+            button_leiste, text="↓", width=30, height=30, corner_radius=15,
+            fg_color=MUL_TURKIS, hover_color=MUL_DUNKEL, font=("Arial", 14, "bold"),
+            command=lade_masse_herunter,
+        )
+        download_button_links.grid(row=0, column=0, sticky="e", padx=(0, 6), pady=(0, 4))
+
+        download_button_rechts = ctk.CTkButton(
+            button_leiste, text="↓", width=30, height=30, corner_radius=15,
+            fg_color=MUL_TURKIS, hover_color=MUL_DUNKEL, font=("Arial", 14, "bold"),
+            command=lade_kinetik_herunter,
+        )
+        download_button_rechts.grid(row=0, column=1, sticky="e", padx=(6, 0), pady=(0, 4))
+
+        def zeige_versuch(anzeige):
+            zustand["versuch_name"] = anzeige_zu_name.get(anzeige, anzeige)
+            zeichne()
+
+        def als_zahl_oder_none(text):
+            text = text.strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+
+        def live_kopplung(entry, label_widget, praefix, suffix=""):
+            def aktualisieren(_event=None):
+                wert = entry.get().strip() or "..."
+                label_widget.configure(text=f"{praefix}{wert}{suffix}")
+            entry.bind("<KeyRelease>", aktualisieren)
+
+        def oeffne_settings():
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("Diagramm-Einstellungen")
+            dialog.geometry("480x680")
+            dialog.minsize(420, 420)
+            dialog.resizable(True, True)
+            dialog.attributes("-topmost", True)
+            dialog.lift()
+            dialog.focus_force()
+
+            def uebernehmen():
+                zustand["title_masse"] = eingabe_titel_masse.get().strip() or zustand["title_masse"]
+                zustand["label_y_masse"] = eingabe_y_label_masse.get().strip() or zustand["label_y_masse"]
+                zustand["label_x"] = eingabe_x_label.get().strip() or zustand["label_x"]
+                zustand["x_min"] = als_zahl_oder_none(eingabe_x_min.get())
+                zustand["x_max"] = als_zahl_oder_none(eingabe_x_max.get())
+                zustand["y_min_masse"] = als_zahl_oder_none(eingabe_y_min_masse.get())
+                zustand["y_max_masse"] = als_zahl_oder_none(eingabe_y_max_masse.get())
+
+                zustand["title_kinetik"] = eingabe_titel_kinetik.get().strip() or zustand["title_kinetik"]
+                zustand["label_y_kinetik"] = eingabe_y_label_kinetik.get().strip() or zustand["label_y_kinetik"]
+                zustand["y_min_kinetik"] = als_zahl_oder_none(eingabe_y_min_kinetik.get())
+                zustand["y_max_kinetik"] = als_zahl_oder_none(eingabe_y_max_kinetik.get())
+
+                zustand["filter_typ"] = filter_dropdown.get()
+                # Alle Parameterfelder (auch von gerade nicht sichtbaren
+                # Filtertypen) uebernehmen, damit beim spaeteren Zurueckwechseln
+                # die zuletzt eingestellten Werte erhalten bleiben.
+                for felder in filter_eingabe_widgets.values():
+                    for schluessel, entry in felder.items():
+                        wert = als_zahl_oder_none(entry.get())
+                        if wert is not None:
+                            zustand[schluessel] = wert
+
+                zeichne()
+                self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+                dialog.destroy()
+
+            button_zeile = ctk.CTkFrame(dialog, fg_color="transparent")
+            button_zeile.pack(side="bottom", fill="x", pady=10)
+            ctk.CTkButton(button_zeile, text="Übernehmen", fg_color=MUL_TURKIS, command=uebernehmen).pack()
+
+            inhalt = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+            inhalt.pack(fill="both", expand=True, padx=5, pady=(10, 0))
+
+            # --- Linkes Diagramm (Relative Masse) ---
+            header_links = ctk.CTkLabel(
+                inhalt, text=f"Linkes Diagramm ({zustand['title_masse']})",
+                font=("Arial", 13, "bold"), anchor="w",
+            )
+            header_links.pack(fill="x", padx=10, pady=(5, 5))
+
+            ctk.CTkLabel(inhalt, text="Titel:", anchor="w").pack(fill="x", padx=10)
+            eingabe_titel_masse = ctk.CTkEntry(inhalt)
+            eingabe_titel_masse.insert(0, zustand["title_masse"])
+            eingabe_titel_masse.pack(fill="x", padx=10, pady=(2, 10))
+            live_kopplung(eingabe_titel_masse, header_links, "Linkes Diagramm (", ")")
+
+            ctk.CTkLabel(inhalt, text="Y-Achsen-Beschriftung:", anchor="w").pack(fill="x", padx=10)
+            eingabe_y_label_masse = ctk.CTkEntry(inhalt)
+            eingabe_y_label_masse.insert(0, zustand["label_y_masse"])
+            eingabe_y_label_masse.pack(fill="x", padx=10, pady=(2, 10))
+
+            ctk.CTkLabel(
+                inhalt, text="X-Achsen-Beschriftung (gilt für beide Diagramme):", anchor="w",
+            ).pack(fill="x", padx=10)
+            eingabe_x_label = ctk.CTkEntry(inhalt)
+            eingabe_x_label.insert(0, zustand["label_x"])
+            eingabe_x_label.pack(fill="x", padx=10, pady=(2, 10))
+
+            bereich_zeile_x = ctk.CTkFrame(inhalt, fg_color="transparent")
+            bereich_zeile_x.pack(fill="x", padx=10, pady=(0, 10))
+            ctk.CTkLabel(bereich_zeile_x, text="X-Achse von/bis:", width=110, anchor="w").pack(side="left")
+            eingabe_x_min = ctk.CTkEntry(bereich_zeile_x, placeholder_text="auto")
+            eingabe_x_min.insert(0, "" if zustand["x_min"] is None else str(zustand["x_min"]))
+            eingabe_x_min.pack(side="left", padx=(5, 5), fill="x", expand=True)
+            eingabe_x_max = ctk.CTkEntry(bereich_zeile_x, placeholder_text="auto")
+            eingabe_x_max.insert(0, "" if zustand["x_max"] is None else str(zustand["x_max"]))
+            eingabe_x_max.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+            bereich_zeile_y_masse = ctk.CTkFrame(inhalt, fg_color="transparent")
+            bereich_zeile_y_masse.pack(fill="x", padx=10, pady=(0, 10))
+            ctk.CTkLabel(bereich_zeile_y_masse, text="Y-Achse von/bis:", width=110, anchor="w").pack(side="left")
+            eingabe_y_min_masse = ctk.CTkEntry(bereich_zeile_y_masse, placeholder_text="auto")
+            eingabe_y_min_masse.insert(0, "" if zustand["y_min_masse"] is None else str(zustand["y_min_masse"]))
+            eingabe_y_min_masse.pack(side="left", padx=(5, 5), fill="x", expand=True)
+            eingabe_y_max_masse = ctk.CTkEntry(bereich_zeile_y_masse, placeholder_text="auto")
+            eingabe_y_max_masse.insert(0, "" if zustand["y_max_masse"] is None else str(zustand["y_max_masse"]))
+            eingabe_y_max_masse.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+            # --- Trennlinie ---
+            ctk.CTkFrame(inhalt, height=2, fg_color=("gray75", "gray30")).pack(fill="x", padx=10, pady=(5, 15))
+
+            # --- Rechtes Diagramm (Reaktionskinetik) ---
+            header_rechts = ctk.CTkLabel(
+                inhalt, text=f"Rechtes Diagramm ({zustand['title_kinetik']})",
+                font=("Arial", 13, "bold"), anchor="w",
+            )
+            header_rechts.pack(fill="x", padx=10, pady=(0, 5))
+
+            ctk.CTkLabel(inhalt, text="Titel:", anchor="w").pack(fill="x", padx=10)
+            eingabe_titel_kinetik = ctk.CTkEntry(inhalt)
+            eingabe_titel_kinetik.insert(0, zustand["title_kinetik"])
+            eingabe_titel_kinetik.pack(fill="x", padx=10, pady=(2, 10))
+            live_kopplung(eingabe_titel_kinetik, header_rechts, "Rechtes Diagramm (", ")")
+
+            ctk.CTkLabel(inhalt, text="Y-Achsen-Beschriftung:", anchor="w").pack(fill="x", padx=10)
+            eingabe_y_label_kinetik = ctk.CTkEntry(inhalt)
+            eingabe_y_label_kinetik.insert(0, zustand["label_y_kinetik"])
+            eingabe_y_label_kinetik.pack(fill="x", padx=10, pady=(2, 10))
+
+            bereich_zeile_y_kinetik = ctk.CTkFrame(inhalt, fg_color="transparent")
+            bereich_zeile_y_kinetik.pack(fill="x", padx=10, pady=(0, 10))
+            ctk.CTkLabel(bereich_zeile_y_kinetik, text="Y-Achse von/bis:", width=110, anchor="w").pack(side="left")
+            eingabe_y_min_kinetik = ctk.CTkEntry(bereich_zeile_y_kinetik, placeholder_text="auto")
+            eingabe_y_min_kinetik.insert(0, "" if zustand["y_min_kinetik"] is None else str(zustand["y_min_kinetik"]))
+            eingabe_y_min_kinetik.pack(side="left", padx=(5, 5), fill="x", expand=True)
+            eingabe_y_max_kinetik = ctk.CTkEntry(bereich_zeile_y_kinetik, placeholder_text="auto")
+            eingabe_y_max_kinetik.insert(0, "" if zustand["y_max_kinetik"] is None else str(zustand["y_max_kinetik"]))
+            eingabe_y_max_kinetik.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+            # --- Filter fuer die Reaktionskinetik (rechtes Diagramm) ---
+            ctk.CTkLabel(inhalt, text="Filter (Glättung):", anchor="w").pack(fill="x", padx=10, pady=(5, 0))
+
+            if _FILTER_IMPORT_FEHLER:
+                ctk.CTkLabel(
+                    inhalt,
+                    text=(
+                        "Filter aus helper/Filter.py konnten nicht geladen werden:\n"
+                        f"{_FILTER_IMPORT_FEHLER}"
+                    ),
+                    text_color="#ff8080", anchor="w", justify="left", wraplength=420,
+                ).pack(fill="x", padx=10, pady=(2, 10))
+
+            filter_parameter_frame = ctk.CTkFrame(inhalt, fg_color="transparent")
+            # gefuellt von _zeige_filter_parameter() weiter unten
+            filter_eingabe_widgets = {}  # {filter_typ: {zustand_schluessel: entry_widget}}
+
+            def _zeige_filter_parameter(*_):
+                for kind in filter_parameter_frame.winfo_children():
+                    kind.destroy()
+                filter_parameter_frame.pack(fill="x", padx=0, pady=(0, 10))
+
+                aktueller_typ = filter_dropdown.get()
+                felder_definition = TGA_FILTER_PARAMETER.get(aktueller_typ, [])
+                widgets_fuer_typ = {}
+                for schluessel, label_text, _default in felder_definition:
+                    ctk.CTkLabel(filter_parameter_frame, text=f"{label_text}:", anchor="w").pack(
+                        fill="x", padx=10
+                    )
+                    eingabe = ctk.CTkEntry(filter_parameter_frame)
+                    eingabe.insert(0, str(zustand.get(schluessel, "")))
+                    eingabe.pack(fill="x", padx=10, pady=(2, 8))
+                    widgets_fuer_typ[schluessel] = eingabe
+                filter_eingabe_widgets[aktueller_typ] = widgets_fuer_typ
+
+            filter_dropdown_werte = TGA_FILTER_OPTIONEN if not _FILTER_IMPORT_FEHLER else ["Kein Filter"]
+            filter_dropdown = ctk.CTkOptionMenu(
+                inhalt, values=filter_dropdown_werte, fg_color=MUL_TURKIS, command=_zeige_filter_parameter,
+            )
+            filter_dropdown.set(
+                zustand.get("filter_typ", "Kein Filter")
+                if zustand.get("filter_typ", "Kein Filter") in filter_dropdown_werte
+                else "Kein Filter"
+            )
+            filter_dropdown.pack(fill="x", padx=10, pady=(2, 8))
+
+            _zeige_filter_parameter()
+
+        dropdown = ctk.CTkOptionMenu(
+            seitenleiste, values=anzeige_werte, command=zeige_versuch, fg_color=MUL_TURKIS,
+        )
+        dropdown.pack(fill="x", pady=(0, 15))
+
+        ctk.CTkButton(
+            seitenleiste, text="Settings", fg_color=MUL_DUNKEL, command=oeffne_settings,
+        ).pack(fill="x")
+
+        zeige_versuch(anzeige_werte[0])
+
+    def _tga_auf_eafd_basis(self, dm_pct, dmdt_pctmin, cao_pct):
+        """
+        Rechnet Relative Masse/Reaktionskinetik von "% der Mischung" (Rohwert
+        aus der Waage) auf "% des EAFD" um - CaO-Anteil wird rausgerechnet
+        (siehe helper/TGA.py:_add_eafd_basis_columns aus dem Labor-Repo):
+            eafd_frac = 1 - cao_frac
+            dm_pct_eafd  = ((dm_pct/100 - cao_frac) / eafd_frac) * 100
+            dmdt_pctmin_eafd = dmdt_pctmin / eafd_frac
+        Gibt (dm_pct, dmdt_pctmin) unverändert zurück (= Mischungs-Basis),
+        falls kein gültiger CaO-Wert vorliegt.
+        """
+        if cao_pct is None or cao_pct < 0 or cao_pct >= 100:
+            return dm_pct, dmdt_pctmin, False
+        cao_frac = cao_pct / 100.0
+        eafd_frac = 1.0 - cao_frac
+        dm_eafd = ((dm_pct / 100.0 - cao_frac) / eafd_frac) * 100.0
+        dmdt_eafd = dmdt_pctmin / eafd_frac
+        return dm_eafd, dmdt_eafd, True
+
+    def _baue_tga_kinetik_filter(self, zustand):
+        """
+        Baut aus den im Settings-Dialog (rechtes Diagramm, "Filter") hinterlegten
+        Werten das passende Filter-Objekt aus helper/Filter.py.
+
+        Gibt None zurück bei "Kein Filter", fehlendem Import (siehe
+        _FILTER_IMPORT_FEHLER) oder ungültigen Parametern - die
+        Reaktionskinetik wird dann unverändert (ungefiltert) gezeichnet.
+        """
+        typ = zustand.get("filter_typ", "Kein Filter")
+        if typ == "Kein Filter" or ButterworthFilter is None:
+            return None
+        try:
+            if typ == "Butterworth":
+                return ButterworthFilter(
+                    cutoff=float(zustand.get("filter_butter_cutoff", 0.05)),
+                    order=int(zustand.get("filter_butter_order", 2)),
+                    time_unit="sec",
+                )
+            if typ == "Savitzky-Golay":
+                fenster = int(zustand.get("filter_savgol_window", 15))
+                if fenster % 2 == 0:
+                    fenster += 1
+                return SavitzkyGolayFilter(
+                    window_length=fenster,
+                    polyorder=int(zustand.get("filter_savgol_polyorder", 2)),
+                )
+            if typ == "Exponentielles gleitendes Mittel":
+                return ExponentialMovingAverage(alpha=float(zustand.get("filter_ema_alpha", 0.3)))
+            if typ == "Median":
+                kernel = int(zustand.get("filter_median_kernel", 9))
+                if kernel % 2 == 0:
+                    kernel += 1
+                return MedianFilter(kernel_size=kernel)
+            if typ == "Gaussian":
+                return GaussianFilter(sigma=float(zustand.get("filter_gauss_sigma", 1.0)))
+            if typ == "Gleitender Mittelwert":
+                return RollingAverage(sampling_rate=int(zustand.get("filter_rollavg_fenster", 10)))
+        except Exception as e:
+            print(f"[TGA-Kinetik-Filter] Ungültige Einstellungen ({typ}): {e}")
+            return None
+        return None
+
+    def zeichne_ergebnis_plot_tga(self, eintrag_info, fig, ax_masse, ax_kinetik, canvas, zustand):
+        """
+        Zeichnet Relative Masse (links) und Reaktionskinetik (rechts) über
+        der Temperatur für einen TGA-Versuch neu in die bestehenden Achsen.
+        Rechnet automatisch auf "% of EAFD" um, falls die CaO-Zugabe für den
+        Versuch im Sheet hinterlegt ist (siehe _tga_auf_eafd_basis).
+        """
+        staub, eintrag, voller_pfad = eintrag_info
+        df = self.lade_ergebnis_dataframe(eintrag, voller_pfad)
+
+        ax_masse.clear()
+        ax_kinetik.clear()
+
+        if df is None or df.empty:
+            ax_masse.text(0.5, 0.5, "Konnte processed_data nicht laden.", ha="center", va="center")
+            ax_kinetik.text(0.5, 0.5, "Konnte processed_data nicht laden.", ha="center", va="center")
+            canvas.draw_idle()
+            return
+
+        sheet_name = self._tga_versuchsname_fuer_sheet(eintrag)
+        tga_parameter = self.hole_tga_parameter_fuer_versuch(sheet_name)
+        cao_pct = tga_parameter.get("cao_pct") if tga_parameter else None
+
+        y_label_masse = zustand["label_y_masse"]
+        y_label_kinetik = zustand["label_y_kinetik"]
+
+        if (
+            "temperature_C" in df.columns
+            and "dm_filtered_pct" in df.columns
+            and "dmdt_filtered_pctmin" in df.columns
+        ):
+            import numpy as np
+            import pandas as pd
+
+            # WICHTIG: NICHT nach temperature_C sortieren! Bei einem
+            # isothermen Haltebereich (Temperatur bleibt ueber viele
+            # Zeitschritte fast konstant, waehrend die Masse weiter faellt)
+            # wuerde eine Sortierung nach Temperatur die echte zeitliche
+            # Reihenfolge durcheinanderwuerfeln - matplotlib verbindet die
+            # Punkte dann kreuz und quer hin und her, was wie eine
+            # ausgefuellte Flaeche aussieht (ist aber ein dichtes
+            # Liniengewirr). Die Parquet-Datei ist bereits chronologisch
+            # sortiert (siehe TGA_calculation.py: sort_values("time_min")),
+            # daher hier nur nach Zeit sortieren (falls vorhanden) bzw. die
+            # bestehende Reihenfolge beibehalten.
+            gueltig = df.dropna(subset=["dm_filtered_pct", "dmdt_filtered_pctmin"])
+            if "time_min" in gueltig.columns:
+                gueltig = gueltig.sort_values("time_min")
+            dm_werte, dmdt_werte, ist_eafd = self._tga_auf_eafd_basis(
+                gueltig["dm_filtered_pct"], gueltig["dmdt_filtered_pctmin"], cao_pct
+            )
+
+            # --- Reaktionskinetik glätten (Settings -> Filter) ---
+            dmdt_anzeige = pd.Series(np.asarray(dmdt_werte)).reset_index(drop=True)
+            kinetik_filter = self._baue_tga_kinetik_filter(zustand)
+            if kinetik_filter is not None:
+                try:
+                    x_index = pd.Series(np.arange(len(dmdt_anzeige), dtype=float))
+                    dmdt_anzeige = kinetik_filter(x_index, dmdt_anzeige)
+                except Exception as e:
+                    print(f"[TGA-Kinetik-Filter] Filter fehlgeschlagen, zeige ungefiltert: {e}")
+                    dmdt_anzeige = pd.Series(np.asarray(dmdt_werte)).reset_index(drop=True)
+
+            # Nur die Linie zeichnen - keine Flächen-Überlagerung unter der Kurve.
+            ax_masse.plot(gueltig["temperature_C"], dm_werte, color=MUL_TURKIS, linewidth=1.5)
+            ax_kinetik.plot(gueltig["temperature_C"].to_numpy(), dmdt_anzeige.to_numpy(), color=MUL_TURKIS, linewidth=1.5)
+            ax_kinetik.axhline(0, linestyle="--", linewidth=0.5, color="grey")
+            if not ist_eafd:
+                # Ohne CaO-Wert bleibt es bei "% of mixture" - Beschriftung
+                # entsprechend anpassen, außer der Nutzer hat sie manuell
+                # überschrieben (dann bleibt seine Wahl unangetastet).
+                if y_label_masse == "Relative Mass\n[% of EAFD]":
+                    y_label_masse = "Relative Mass\n[% of mixture]"
+                if y_label_kinetik == "Reaction Kinetics\n[%/min of EAFD]":
+                    y_label_kinetik = "Reaction Kinetics\n[%/min of mixture]"
+
+        ax_masse.set_xlabel(zustand["label_x"])
+        ax_masse.set_ylabel(y_label_masse)
+        ax_masse.set_title(zustand["title_masse"])
+        ax_masse.set_xlim(left=zustand["x_min"], right=zustand["x_max"])
+        ax_masse.set_ylim(bottom=zustand["y_min_masse"], top=zustand["y_max_masse"])
+        ax_masse.grid(True, alpha=0.3)
+
+        ax_kinetik.set_xlabel(zustand["label_x"])
+        ax_kinetik.set_ylabel(y_label_kinetik)
+        ax_kinetik.set_title(zustand["title_kinetik"])
+        ax_kinetik.set_xlim(left=zustand["x_min"], right=zustand["x_max"])
+        ax_kinetik.set_ylim(bottom=zustand["y_min_kinetik"], top=zustand["y_max_kinetik"])
+        ax_kinetik.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        canvas.draw_idle()
+
+    # ------------------------------------------------------------------
     # HILFSFUNKTIONEN (Ordnerstruktur)
     # ------------------------------------------------------------------
     def erstelle_versuchs_struktur(self, projekt, staub, methode):
@@ -1568,7 +2323,6 @@ class LaborApp(ctk.CTk):
         ziel_ordner = os.path.join(methode_ordner, "outputs", "diagramm")
         os.makedirs(ziel_ordner, exist_ok=True)
         return ziel_ordner
-
 
 if __name__ == "__main__":
     app = LaborApp()

@@ -1,0 +1,107 @@
+{
+  "process_file": "yes",
+
+  "pre_filter": [
+    {
+      "use": "no",
+      "type": "RollingAverage",
+      "params": {
+        "sampling_rate": 50
+      }
+    },
+    {
+      "use": "no",
+      "type": "Butterworth",
+      "params": {
+        "cutoff": 0.05,
+        "order": 2,
+        "time_unit": "min"
+      }
+    },
+    {
+      "use": "yes",
+      "type": "MovingAverage",
+      "params": {
+        "sampling_rate": 70,
+        "align": "center",
+        "include_partial": true
+      }
+    },
+    {
+      "use": "no",
+      "type": "SavitzkyGolay",
+      "params": {
+        "window_length": 10,
+        "polyorder": 2
+      }
+    },
+    {
+      "use": "no",
+      "type": "Gaussian",
+      "params": {
+        "sigma": 2.0
+      }
+    }
+  ],
+
+  "post_filter": [
+    {
+      "use": "no",
+      "type": "RollingAverage",
+      "params": {
+        "sampling_rate": 50
+      }
+    },
+    {
+      "use": "yes",
+      "type": "Butterworth",
+      "params": {
+        "cutoff": 0.005,
+        "order": 2,
+        "time_unit": "min"
+      }
+    },
+    {
+      "use": "no",
+      "type": "MovingAverage",
+      "params": {
+        "sampling_rate": 70,
+        "align": "center",
+        "include_partial": true
+      }
+    },
+    {
+      "use": "no",
+      "type": "SavitzkyGolay",
+      "params": {
+        "window_length": 10,
+        "polyorder": 2
+      }
+    },
+    {
+      "use": "no",
+      "type": "Gaussian",
+      "params": {
+        "sigma": 2.0
+      }
+    }
+  ],
+
+  "cut_reactive": {
+    "lower_temp": 500,
+    "upper_temp": 1050
+  },
+
+  "cut_tail": {
+    "enabled": false,
+    "threshold": -0.8,
+    "buffer": 200
+  },
+
+  "gas_columns": {
+    "Gas1": "CO",
+    "Gas2": "CO2",
+    "Purge": "Ar",
+    "Water": "water_ml"
+  }
+}

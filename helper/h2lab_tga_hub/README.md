@@ -1,0 +1,88 @@
+# H2Lab TGA Desktop App
+
+## Purpose
+Modular PySide6 desktop app for interactive TGA workflows (discover -> process -> visualize) on any folder you select.
+
+## New Folder-Based Workflow
+- On startup, the app asks you to choose a data folder.
+- The selected folder is scanned recursively for supported files (`.txt`, `.csv`, `.parquet`).
+- You can change folder without restart via `File -> Switch Folder`.
+
+## Storage Behavior
+- Processed parquet files: saved next to each source file.
+- App metadata (runs, logs, state, presets): saved in `<selected_folder>/.h2lab_tga`.
+
+## Quick Start (Desktop)
+```powershell
+cd "C:\Users\aaron\PycharmProjects\H2Lab\helper\h2lab_tga_hub"
+pip install -e .[dev]
+h2lab-tga-desktop
+```
+
+Recommended environment layout:
+```powershell
+$env:H2LAB_SHAREPOINT_PATH="C:\Users\aaron\OneDrive - HydrogenReductionLab\Hydrogen Reductionlab - sharepoint\H2Lab"
+$env:H2LAB_LOCAL_REPO_ROOT="C:\Users\aaron\PycharmProjects\H2Lab"
+```
+
+- `H2LAB_SHAREPOINT_PATH`: OneDrive/project data root used by folder picker defaults and data discovery.
+- `H2LAB_LOCAL_REPO_ROOT` (optional but recommended): local Git workspace root used to locate `TGA/config.json`.
+- You should start the app from inside `helper/h2lab_tga_hub`.
+
+## Batch Run CLI
+Run over any folder directly:
+```powershell
+h2lab-tga-make-run --data-root "C:\Users\aaron\PycharmProjects\H2Lab\H2Lab_PUB_25_9 Lime in EAFD Recycling\TGA"
+```
+
+Select specific experiments:
+```powershell
+h2lab-tga-make-run --data-root "C:\path\to\data" --experiments RT54,RT55 --reference-temp-c 950
+```
+
+Legacy mode is still available:
+```powershell
+$env:H2LAB_SHAREPOINT_PATH="C:\Users\aaron\OneDrive - HydrogenReductionLab\Hydrogen Reductionlab - sharepoint\H2Lab"
+$env:H2LAB_LOCAL_REPO_ROOT="C:\Users\aaron\PycharmProjects\H2Lab"
+h2lab-tga-make-run --project "H2Lab_PUB_25_9 Lime in EAFD Recycling"
+```
+
+## Tester Feedback Tasks
+- Right-click any Qt widget in the app to open a feedback task dialog.
+- Tasks are saved in SQLite at `<selected_folder>/.h2lab_tga/tasks/tasks.sqlite`.
+
+List tasks:
+```powershell
+h2lab-tga-tasks
+```
+
+The no-argument command opens a folder picker and then prints the task list.
+
+Explicit folder mode:
+```powershell
+h2lab-tga-tasks --data-root "C:\path\to\selected\folder" list
+```
+
+Filter and export:
+```powershell
+h2lab-tga-tasks --data-root "C:\path\to\selected\folder" list --status OPEN --severity HIGH --csv ".\tasks.csv"
+```
+
+Show summary stats:
+```powershell
+h2lab-tga-tasks --data-root "C:\path\to\selected\folder" stats
+```
+
+## Run Tests
+```powershell
+pytest
+```
+
+## Architecture
+- `config`: settings and path resolution
+- `data`: discovery and file parsers
+- `pipeline`: processing adapter and orchestration
+- `services`: app services for runs and catalog
+- `desktop`: PySide6 desktop UI
+- `ui_common`: UI-agnostic layout/plot helpers
+- `infra`: state persistence, logging, filesystem helpers

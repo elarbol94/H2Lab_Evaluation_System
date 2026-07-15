@@ -1,51 +1,55 @@
 """
 Minimaler Ersatz für project_paths.py.
 
-EMI_calculation.py importiert beim Start `ensure_storage_dirs` und
-`get_storage_context`, um Standard-Ordner (raw_data/, processed_data/, ...)
-zu bestimmen. In H2Lab werden input_dir/output_dir aber bei JEDEM Aufruf
-explizit über --input-dir/--output-dir gesetzt (siehe main.py:
-fuehre_emi_berechnung_aus). Die Werte hier unten sind daher nur
-Platzhalter/Defaults, falls --input-dir/--output-dir mal fehlen sollten -
-sie werden im normalen H2Lab-Betrieb nicht verwendet.
+EMI_calculation.py / TGA_calculation.py importieren beim Start
+`ensure_storage_dirs` und `get_storage_context`, um Standard-Ordner zu
+bestimmen. In H2Lab werden input_dir/output_dir aber bei JEDEM Aufruf
+explizit über --input-dir/--output-dir gesetzt (siehe main.py).
+Die Werte hier sind daher nur Platzhalter/Defaults.
 
-Diese Datei muss im selben Ordner liegen wie EMI_calculation.py.
+Struktur pro Methode unterhalb von PROJECT_BASE:
 
-Struktur unterhalb von STORAGE_ROOT (= der EMI-Ordner des Projekts):
-
-    EMI/
+    <Methode>/
       data/
-        raw_data/         <- rohe Proben-Ordner (.dat-Dateien)
-        processed_data/   <- von EMI_calculation.py erzeugte *_results.parquet
-      outputs/             <- z.B. exportierte Diagramme
+        raw_data/         <- Rohdaten (.dat-Ordner bzw. .txt-Dateien)
+        processed_data/   <- *_results.parquet
+      outputs/
+        diagramm/         <- exportierte Diagramm-Bilder (später befüllt)
 
-"data" bündelt also raw_data + processed_data, "outputs" liegt separat
-daneben - das entspricht der Ordnerwahl "data" vs. "outputs" im EMI-Ordner.
+Hinweis: "diagramm" (deutsch, doppel-m) - MUSS ident zu main.py sein, das
+überall "outputs/diagramm" anlegt/erwartet (siehe main.py:
+erstelle_versuchs_struktur() und diagramm_ordner_fuer()). Ein einzelnes
+"diagram" hier würde main.py nie finden und einen zusätzlichen,
+funktionslosen Ordner erzeugen.
 """
 
 from pathlib import Path
 
-# Fallback-Root für diesen Projektordner (WeTransfer-Kopie von
-# H2Lab_PUB_25_9 Lime Addition in EAFD Recycling). Wird nur benutzt, wenn
-# main.py ausnahmsweise ohne --input-dir/--output-dir aufruft - im
-# normalen H2Lab-Betrieb werden die Pfade ja explizit übergeben.
-STORAGE_ROOT = Path(
+PROJECT_BASE = Path(
     r"C:\Users\marty\Desktop\wetransfer_h2lab_pub_25_9-lime-addition-in-eafd-recycling_2026-07-08_0739"
-    r"\H2Lab_PUB_25_9 Lime Addition in EAFD Recycling\EMI"
+    r"\H2Lab_PUB_25_9 Lime Addition in EAFD Recycling"
 )
+
+METHOD_STORAGE_ROOTS = {
+    "EMI": PROJECT_BASE / "EMI",
+    "TGA": PROJECT_BASE / "TGA",
+}
 
 
 class StorageContext:
-    def __init__(self, storage_root):
+    def __init__(self, storage_root, method="EMI"):
+        self.method = str(method or "EMI").upper()
         self.storage_root = Path(storage_root)
         self.raw_data_dir = self.storage_root / "data" / "raw_data"
         self.parquet_data_dir = self.storage_root / "data" / "processed_data"
-        self.outputs_dir = self.storage_root / "outputs"
-        self.mode = "H2Lab-Fallback"
+        self.outputs_dir = self.storage_root / "outputs" / "diagramm"
+        self.mode = f"H2Lab-Fallback-{self.method}"
 
 
-def get_storage_context():
-    return StorageContext(STORAGE_ROOT)
+def get_storage_context(method="EMI"):
+    methode = str(method or "EMI").upper()
+    root = METHOD_STORAGE_ROOTS.get(methode, METHOD_STORAGE_ROOTS["EMI"])
+    return StorageContext(root, methode)
 
 
 def ensure_storage_dirs(context=None):

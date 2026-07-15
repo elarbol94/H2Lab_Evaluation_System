@@ -1,0 +1,5 @@
+[console_scripts]
+h2lab-tga-app = h2lab_tga_app.main:cli
+h2lab-tga-desktop = h2lab_tga_app.desktop.app:main
+h2lab-tga-make-run = h2lab_tga_app.cli:make_run_cli
+h2lab-tga-tasks = h2lab_tga_app.tasks_cli:main

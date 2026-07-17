@@ -237,11 +237,13 @@ def _process_file(path):
 
     df["dmdt_original_pctmin"] = (df["dm_original_pct"].diff() / df["time_min"].diff()).bfill()
     df["dmdt_filtered_pctmin"] = (df["dm_filtered_pct"].diff() / df["time_min"].diff()).bfill()
+    df["m_filtered_mg"] = initial_weight_mg + df["dm_filtered_mg"]
+    df["dmdt_filtered_mgmin"] = (df["dm_filtered_mg"].diff() / df["time_min"].diff()).bfill()
 
     return df[[
         "temperature_C", "time_min",
-        "dm_original_pct", "dm_filtered_pct",
-        "dmdt_original_pctmin", "dmdt_filtered_pctmin",
+        "dm_original_pct", "dm_filtered_pct", "m_filtered_mg",
+        "dmdt_original_pctmin", "dmdt_filtered_pctmin", "dmdt_filtered_mgmin",
     ]]
 
 

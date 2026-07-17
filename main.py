@@ -231,14 +231,28 @@ TGA_FILTER_PARAMETER = {
 TGA_ERGEBNIS_SPALTEN = [
     ("temperature_C", "Temperatur"),
     ("time_min", "Zeit [min]"),
-    ("dm_original_pct", "Masse % (roh)"),
     ("dm_filtered_pct", "Masse % (gefiltert)"),
-    ("dmdt_original_pctmin", "Reaktionskinetik (roh)"),
-    ("dmdt_filtered_pctmin", "Reaktionskinetik (gefiltert)"),
+    ("m_filtered_mg", "Masse abs (gefiltert)"),
+    ("dmdt_filtered_pctmin", "Reaktionskinetik"),
+    ("dmdt_filtered_mgmin", "Reaktionskinetik absolut"),
 ]
 TGA_ERGEBNIS_SPALTEN_LABELS = [label for _spalte, label in TGA_ERGEBNIS_SPALTEN]
 TGA_ERGEBNIS_LABEL_ZU_SPALTE = {label: spalte for spalte, label in TGA_ERGEBNIS_SPALTEN}
 TGA_ERGEBNIS_SPALTE_ZU_LABEL = {spalte: label for spalte, label in TGA_ERGEBNIS_SPALTEN}
+TGA_ACHSEN_LABELS = {
+    "Temperatur": "Temperatur [°C]",
+    "Zeit [min]": "Zeit [min]",
+    "Masse % (gefiltert)": "relative Masse [%]",
+    "Masse abs (gefiltert)": "absolute Masse [mg]",
+    "Reaktionskinetik": "relative Reaktionskinetik [%/min]",
+    "Reaktionskinetik absolut": "absoluter Reaktionskinetik [mg/min]",
+}
+
+
+def tga_achsen_label_fuer_spalte(spalte):
+    """Liefert die einheitliche Achsenbeschriftung der gewählten Datenreihe."""
+    label = TGA_ERGEBNIS_SPALTE_ZU_LABEL.get(spalte, spalte)
+    return TGA_ACHSEN_LABELS.get(label, str(label))
 
 # Optional: anderer Python-Interpreter für die EMI-Berechnung (falls HSMTools
 # in einer eigenen venv installiert ist, nicht in der venv der GUI-App).
@@ -1314,7 +1328,7 @@ class LaborApp(ctk.CTk):
         button_zeile.pack(side="bottom", fill="x", padx=5, pady=8)
         ctk.CTkButton(
             button_zeile,
-            text="Berechnen",
+            text="Alle Berechnen",
             fg_color=MUL_TURKIS,
             command=lambda: self.starte_berechnung(projekt, methode, parent),
         ).pack(side="right")
@@ -1368,13 +1382,91 @@ class LaborApp(ctk.CTk):
     def speichere_diagramm_einstellungen(self, projekt, methode, zustand):
         """Schreibt die aktuellen Diagramm-Einstellungen auf die Platte (bleiben nach Neustart erhalten)."""
         pfad = self._pfad_diagramm_einstellungen(projekt, methode)
-        speicherbar = {k: v for k, v in zustand.items() if k != "versuch_name"}
+        speicherbar = {k: v for k, v in zustand.items() if k != "versuch_name" and not str(k).startswith("_")}
         try:
             os.makedirs(os.path.dirname(pfad), exist_ok=True)
             with open(pfad, "w", encoding="utf-8") as f:
                 json.dump(speicherbar, f, ensure_ascii=False, indent=2)
         except OSError as e:
             print(f"[Diagramm-Einstellungen speichern Fehler] {pfad}: {e}")
+
+    # ------------------------------------------------------------------
+    # DIAGRAMM-DARSTELLUNG PRO VERSUCH (Ergebnisse-Tabs EMI/TGA): jedes
+    # Diagramm jedes einzelnen Versuchs behaelt seine eigene Darstellung
+    # (Titel, Achsen, Farbe, Schrift, ...) - analog zum bereits bestehenden
+    # Muster fuer die Rohdaten-Filter-Einstellungen (siehe oben). Eigene
+    # Ablagedatei, damit sie NICHT mit der aelteren, projektweiten
+    # ".diagramm_einstellungen_<methode>.json" kollidiert; diese bleibt als
+    # Fallback/Ausgangsbasis fuer Versuche ohne eigene Einstellungen aktiv.
+    # ------------------------------------------------------------------
+    def _pfad_diagramm_einstellungen_versuch(self, projekt, methode):
+        root = self.get_projekt_root(projekt)
+        return os.path.join(root, f".diagramm_einstellungen_{methode}_versuche.json")
+
+    def _lade_diagramm_einstellungen_versuch_datei(self, projekt, methode):
+        pfad = self._pfad_diagramm_einstellungen_versuch(projekt, methode)
+        try:
+            with open(pfad, "r", encoding="utf-8") as f:
+                daten = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {"versuche": {}}
+        if isinstance(daten, dict):
+            daten.setdefault("versuche", {})
+            return daten
+        return {"versuche": {}}
+
+    def _speichere_diagramm_einstellungen_versuch_datei(self, projekt, methode, daten):
+        pfad = self._pfad_diagramm_einstellungen_versuch(projekt, methode)
+        try:
+            os.makedirs(os.path.dirname(pfad), exist_ok=True)
+            with open(pfad, "w", encoding="utf-8") as f:
+                json.dump(daten, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"[Diagramm-Einstellungen (pro Versuch) speichern Fehler] {pfad}: {e}")
+
+    def lade_diagramm_einstellungen_fuer_versuch(self, projekt, methode, versuch_schluessel, standard):
+        """
+        Laedt die Darstellungs-Einstellungen (Titel, Achsen, Farbe, Schrift,
+        Wertebereiche, ...) fuer EINEN einzelnen Versuch. Prioritaet
+        (niedrig -> hoch): eingebaute Standardwerte < aeltere projektweite
+        Datei (Migrations-/Erstfall-Basis, z.B. von vor der Umstellung auf
+        pro-Versuch-Einstellungen) < individuell fuer DIESEN Versuch
+        gespeicherte Werte.
+        """
+        zustand = dict(standard)
+        alte_gemeinsame = self.lade_diagramm_einstellungen(projekt, methode, {})
+        zustand.update({k: v for k, v in alte_gemeinsame.items() if k in zustand})
+        daten = self._lade_diagramm_einstellungen_versuch_datei(projekt, methode)
+        if versuch_schluessel:
+            zustand.update(daten.get("versuche", {}).get(versuch_schluessel, {}))
+        return zustand
+
+    def speichere_diagramm_einstellungen_fuer_versuch(self, projekt, methode, versuch_schluessel, zustand):
+        """Speichert die aktuelle Darstellung NUR fuer diesen einen Versuch."""
+        if not versuch_schluessel:
+            return
+        daten = self._lade_diagramm_einstellungen_versuch_datei(projekt, methode)
+        speicherbar = {k: v for k, v in zustand.items() if k != "versuch_name" and not str(k).startswith("_")}
+        daten["versuche"][versuch_schluessel] = speicherbar
+        self._speichere_diagramm_einstellungen_versuch_datei(projekt, methode, daten)
+
+    def speichere_diagramm_einstellungen_fuer_alle(self, projekt, methode, versuch_schluessel_liste, zustand):
+        """
+        Uebernimmt die aktuelle Darstellung fuer ALLE uebergebenen Versuche
+        (Button 'Fuer alle Versuche uebernehmen') - ueberschreibt dabei auch
+        bereits individuell abweichend gesetzte Werte dieser Versuche.
+        Zusaetzlich wird der Zustand als neuer projektweiter "Standard"
+        (aeltere, gemeinsame Datei) gespeichert, damit spaeter neu hinzu-
+        kommende Versuche (noch ohne eigene Einstellung) ebenfalls damit
+        starten.
+        """
+        speicherbar = {k: v for k, v in zustand.items() if k != "versuch_name" and not str(k).startswith("_")}
+        self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+        daten = self._lade_diagramm_einstellungen_versuch_datei(projekt, methode)
+        for versuch_schluessel in versuch_schluessel_liste:
+            if versuch_schluessel:
+                daten["versuche"][versuch_schluessel] = dict(speicherbar)
+        self._speichere_diagramm_einstellungen_versuch_datei(projekt, methode, daten)
 
     # ------------------------------------------------------------------
     # ROHDATEN-VORSCHAU (TGA): Filter-1/Filter-2 Einstellungen - eigene
@@ -1709,7 +1801,9 @@ class LaborApp(ctk.CTk):
         if zoom_zustand is not None:
             self._wende_zoom_an(achsen, zoom_zustand)
 
-        fig.tight_layout()
+        # Grosszuegigerer Abstand zwischen den 4 Diagrammen (Standard-
+        # tight_layout() ohne Padding wirkt zu eng beieinander).
+        fig.tight_layout(w_pad=3.0, h_pad=3.0, pad=1.5)
         canvas.draw_idle()
 
     # ------------------------------------------------------------------
@@ -1756,6 +1850,43 @@ class LaborApp(ctk.CTk):
             puffer = spanne * 0.08
             ax.set_ylim(y_min - puffer, y_max + puffer)
 
+    def _dynamische_figsize(self, frame, spalten, zeilen, mindest_breite_px=650, mindest_hoehe_px=420,
+                             breite_anteil=1.0, hoehe_anteil=1.0, dpi=100):
+        """
+        Berechnet eine an den tatsächlich verfügbaren Platz (Frame- bzw.
+        ersatzweise Bildschirmgröße) angepasste figsize, statt eine fixe
+        Größe zu erzwingen - dadurch bekommen die Diagramme auf kleinen
+        Laptop-Bildschirmen genug Platz zueinander und wirken auf großen
+        Monitoren nicht winzig/eng zusammengequetscht.
+        """
+        try:
+            frame.update_idletasks()
+            breite_px = frame.winfo_width()
+            hoehe_px = frame.winfo_height()
+        except Exception:
+            breite_px = hoehe_px = 0
+
+        # Frame evtl. noch nicht "gemappt" (winfo liefert dann 1 oder 0) ->
+        # auf Bildschirmgröße als Ersatz zurückfallen, damit der allererste
+        # Diagrammaufbau nicht winzig gerät.
+        if breite_px <= 1:
+            breite_px = int(self.winfo_screenwidth() * 0.55)
+        if hoehe_px <= 1:
+            hoehe_px = int(self.winfo_screenheight() * 0.6)
+
+        breite_px = max(int(breite_px * breite_anteil), mindest_breite_px)
+        hoehe_px = max(int(hoehe_px * hoehe_anteil), mindest_hoehe_px)
+
+        # Nach oben absichern: auf sehr großen Bildschirmen sollen die
+        # Diagramme nicht unnötig riesig (und damit die Schrift winzig
+        # relativ zur Fläche) werden.
+        max_breite = max(self.winfo_screenwidth() - 200, mindest_breite_px)
+        max_hoehe = max(self.winfo_screenheight() - 200, mindest_hoehe_px)
+        breite_px = min(breite_px, max_breite)
+        hoehe_px = min(hoehe_px, max_hoehe)
+
+        return (breite_px / dpi, hoehe_px / dpi)
+
     def _aktiviere_zoom_lupe(self, fig, achsen, canvas, zoom_zustand):
         """
         Macht die 2x2-Vorschau per Maus zoombar ("Lupe"):
@@ -1779,7 +1910,7 @@ class LaborApp(ctk.CTk):
             zoom_zustand["x_min"] = None
             zoom_zustand["x_max"] = None
             self._wende_zoom_an(achsen, zoom_zustand)
-            fig.tight_layout()
+            fig.tight_layout(w_pad=3.0, h_pad=3.0, pad=1.5)
             canvas.draw_idle()
 
         def _on_press(event):
@@ -1832,7 +1963,7 @@ class LaborApp(ctk.CTk):
             zoom_zustand["x_min"] = min(start_x, end_x)
             zoom_zustand["x_max"] = max(start_x, end_x)
             self._wende_zoom_an(achsen, zoom_zustand)
-            fig.tight_layout()
+            fig.tight_layout(w_pad=3.0, h_pad=3.0, pad=1.5)
             canvas.draw_idle()
 
         canvas.mpl_connect("button_press_event", _on_press)
@@ -2010,7 +2141,7 @@ class LaborApp(ctk.CTk):
         button_zeile.pack(side="bottom", fill="x", padx=5, pady=8)
         ctk.CTkButton(
             button_zeile,
-            text="Berechnen",
+            text="Alle Berechnen",
             fg_color=MUL_TURKIS,
             command=lambda: self.starte_berechnung(projekt, methode, parent),
         ).pack(fill="x")
@@ -2083,7 +2214,12 @@ class LaborApp(ctk.CTk):
         mitte = ctk.CTkFrame(haupt_layout, fg_color="transparent")
         mitte.pack(side="left", fill="both", expand=True, padx=(0, 0))
 
-        fig, achsen_grid = plt.subplots(2, 2, figsize=(9.5, 6.5))
+        # Größe folgt dem tatsächlich verfügbaren Platz in der Mitte-Spalte
+        # (bzw. ersatzweise dem Bildschirm) statt einer fixen Größe - so
+        # bekommen die 4 Diagramme auf kleinen Bildschirmen mehr Luft
+        # zueinander und auf großen Bildschirmen mehr Fläche.
+        figsize = self._dynamische_figsize(mitte, 2, 2, mindest_breite_px=650, mindest_hoehe_px=500)
+        fig, achsen_grid = plt.subplots(2, 2, figsize=figsize)
         achsen = (achsen_grid[0, 0], achsen_grid[0, 1], achsen_grid[1, 0], achsen_grid[1, 1])
         canvas = FigureCanvasTkAgg(fig, master=mitte)
         canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -2372,6 +2508,8 @@ class LaborApp(ctk.CTk):
         # x_min/x_max des Höhenverlaufs links, siehe unten).
         zustand_standard = {
             "versuch_name": None,
+            # Diagramme nebeneinander (horizontal) oder untereinander (vertical).
+            "diagramm_layout": "horizontal",
             "title_hoehe": "Höhenverlauf",
             "label_x": "Temperature [°C]",
             "label_y": "Sample Height [% of initial]",
@@ -2386,6 +2524,12 @@ class LaborApp(ctk.CTk):
             "y_max_form": None,
             "farbskala_min": None,
             "farbskala_max": None,
+            # --- Darstellung (Linie, Schrift, Hintergrund) ---
+            "linienfarbe": MUL_TURKIS,
+            "linienbreite": 2,
+            "schriftgroesse_titel": 13,
+            "schriftgroesse_achsen": 11,
+            "hintergrund_figure": "#ffffff",
         }
         zustand = self.lade_diagramm_einstellungen(projekt, methode, zustand_standard)
 
@@ -2449,8 +2593,12 @@ class LaborApp(ctk.CTk):
         button_leiste.grid_columnconfigure(0, weight=1)
         button_leiste.grid_columnconfigure(1, weight=1)
 
-        # Figure/Canvas EINMAL erzeugen (siehe Docstring oben)
-        fig, (ax_hoehe, ax_form) = plt.subplots(1, 2, figsize=(10, 4.6))
+        # Figure/Canvas EINMAL erzeugen (siehe Docstring oben). Größe folgt
+        # dem tatsächlich verfügbaren Platz im Diagramm-Bereich statt einer
+        # fixen Größe - so bekommen die beiden Diagramme auf kleinen
+        # Bildschirmen mehr Luft zueinander und auf großen mehr Fläche.
+        figsize = self._dynamische_figsize(plot_frame, 1, 2, mindest_breite_px=700, mindest_hoehe_px=420)
+        fig, (ax_hoehe, ax_form) = plt.subplots(1, 2, figsize=figsize)
         canvas = FigureCanvasTkAgg(fig, master=plot_frame)
         canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
 
@@ -2460,14 +2608,38 @@ class LaborApp(ctk.CTk):
         sm.set_array([])
         farbskala = fig.colorbar(sm, ax=ax_form, shrink=0.85)
 
+        def _eintrag_info_fuer(versuch_name):
+            return next(
+                (s, e, p) for s, e, p in verarbeitete_versuche
+                if os.path.splitext(e)[0] == versuch_name
+            )
+
+        def _versuch_schluessel(versuch_name):
+            """Eindeutiger Schluessel dieses Versuchs, unter dem seine
+            individuelle Diagramm-Darstellung gespeichert wird."""
+            if not versuch_name:
+                return None
+            try:
+                _s, _e, voller_pfad = _eintrag_info_fuer(versuch_name)
+            except StopIteration:
+                return versuch_name
+            return self.versuch_schluessel_rohdaten_filter(projekt, voller_pfad)
+
+        def _speichern():
+            """Speichert die aktuelle Darstellung NUR fuer den gerade
+            angezeigten Versuch - Aenderungen wirken sich damit nicht mehr
+            automatisch auf andere Versuche aus (siehe Button 'Fuer alle
+            Versuche uebernehmen', falls vorhanden, fuer den Fall, dass
+            wirklich ALLE Versuche auf einmal aktualisiert werden sollen)."""
+            self.speichere_diagramm_einstellungen_fuer_versuch(
+                projekt, methode, _versuch_schluessel(zustand.get("versuch_name")), zustand,
+            )
+
         def zeichne():
             versuch_name = zustand["versuch_name"]
             if not versuch_name:
                 return
-            eintrag_info = next(
-                (s, e, p) for s, e, p in verarbeitete_versuche
-                if os.path.splitext(e)[0] == versuch_name
-            )
+            eintrag_info = _eintrag_info_fuer(versuch_name)
             # Für den Download-Button gemerkt: der tatsächliche raw_data-
             # Ordner dieses Versuchs, um daraus den Ausgabe-Ordner zu
             # spiegeln (siehe diagramm_ordner_fuer).
@@ -2480,6 +2652,32 @@ class LaborApp(ctk.CTk):
             self.zeichne_ergebnis_plot(
                 eintrag_info, fig, ax_hoehe, ax_form, canvas, sm, farbskala, zustand, np, mcolors
             )
+
+        def setze_layout(layout, speichern=True):
+            """Ersetzt Figure und Canvas vollständig (inkl. Farbskala), damit
+            keine alten Achsen überlappen. Größe richtet sich weiterhin nach
+            dem tatsächlich verfügbaren Platz."""
+            nonlocal fig, canvas, ax_hoehe, ax_form, farbskala
+            zustand["diagramm_layout"] = layout
+            canvas.get_tk_widget().destroy()
+            plt.close(fig)
+            if layout == "vertical":
+                # Bei zwei übereinanderliegenden Plots darf die Figure nicht
+                # die komplette (oft sehr breite) Fensterbreite einnehmen -
+                # Breite wird daher an der Höhe orientiert.
+                vfigsize = self._dynamische_figsize(
+                    plot_frame, 1, 2, mindest_breite_px=520, mindest_hoehe_px=680, breite_anteil=0.75,
+                )
+                fig, (ax_hoehe, ax_form) = plt.subplots(2, 1, figsize=vfigsize)
+            else:
+                figsize = self._dynamische_figsize(plot_frame, 1, 2, mindest_breite_px=700, mindest_hoehe_px=420)
+                fig, (ax_hoehe, ax_form) = plt.subplots(1, 2, figsize=figsize)
+            canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+            canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            farbskala = fig.colorbar(sm, ax=ax_form, shrink=0.85)
+            zeichne()
+            if speichern:
+                _speichern()
 
         def speichere_diagrammausschnitt(ax, dateiname_teil):
             """
@@ -2532,7 +2730,15 @@ class LaborApp(ctk.CTk):
         download_button_rechts.grid(row=0, column=1, sticky="e", padx=(6, 0), pady=(0, 4))
 
         def zeige_versuch(anzeige):
-            zustand["versuch_name"] = anzeige_zu_name.get(anzeige, anzeige)
+            versuch_name = anzeige_zu_name.get(anzeige, anzeige)
+            layout_backup = zustand.get("diagramm_layout", "horizontal")
+            neuer_zustand = self.lade_diagramm_einstellungen_fuer_versuch(
+                projekt, methode, _versuch_schluessel(versuch_name), zustand_standard,
+            )
+            neuer_zustand["versuch_name"] = versuch_name
+            neuer_zustand["diagramm_layout"] = layout_backup
+            zustand.clear()
+            zustand.update(neuer_zustand)
             zeichne()
 
         def als_zahl_oder_none(text):
@@ -2556,7 +2762,99 @@ class LaborApp(ctk.CTk):
                 label_widget.configure(text=f"{praefix}{wert}{suffix}")
             entry.bind("<KeyRelease>", aktualisieren)
 
+        def oeffne_darstellung():
+            """Separater Dialog für die Anordnung der beiden Diagramme."""
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("Darstellung")
+            dialog.geometry("360x180")
+            dialog.minsize(320, 160)
+            dialog.attributes("-topmost", True)
+            dialog.lift()
+            dialog.focus_force()
+
+            inhalt = ctk.CTkFrame(dialog, fg_color="transparent")
+            inhalt.pack(fill="both", expand=True, padx=15, pady=15)
+            ctk.CTkLabel(inhalt, text="Anordnung der Diagramme:", anchor="w").pack(fill="x", pady=(0, 8))
+            layout_labels = {
+                "Horizontal (nebeneinander)": "horizontal",
+                "Vertikal (übereinander)": "vertical",
+            }
+            layout_werte = {wert: label for label, wert in layout_labels.items()}
+
+            def _layout_gewaehlt(_=None):
+                setze_layout(layout_labels.get(layout_dropdown.get(), "horizontal"))
+
+            layout_dropdown = ctk.CTkOptionMenu(
+                inhalt, values=list(layout_labels), fg_color=MUL_TURKIS,
+                command=_layout_gewaehlt,
+            )
+            layout_dropdown.set(layout_werte.get(
+                zustand.get("diagramm_layout", "horizontal"), "Horizontal (nebeneinander)"
+            ))
+            layout_dropdown.pack(fill="x")
+            dialog.bind("<Return>", _layout_gewaehlt)
+
         def oeffne_settings():
+            """
+            # Plot Settings enthält bewusst nur die Daten-Auswahl. Alle
+            # Stil- und Layout-Optionen liegen im separaten Darstellung-Button.
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("Plot Settings")
+            dialog.geometry("420x420")
+            dialog.minsize(380, 320)
+            dialog.attributes("-topmost", True)
+            dialog.lift()
+            dialog.focus_force()
+
+            tabs_kurz = ctk.CTkTabview(dialog, fg_color="transparent")
+            tabs_kurz.pack(fill="both", expand=True, padx=5, pady=(10, 0))
+            tab1_kurz = tabs_kurz.add("Diagramm 1")
+            tab2_kurz = tabs_kurz.add("Diagramm 2")
+
+            def _diagramm_felder(parent_tab, titel_key, x_key, y_key):
+                inhalt_kurz = ctk.CTkFrame(parent_tab, fg_color="transparent")
+                inhalt_kurz.pack(fill="both", expand=True, padx=10, pady=10)
+                ctk.CTkLabel(inhalt_kurz, text="Titel:", anchor="w").pack(fill="x")
+                titel = ctk.CTkEntry(inhalt_kurz)
+                titel.insert(0, zustand[titel_key])
+                titel.pack(fill="x", pady=(2, 12))
+                ctk.CTkLabel(inhalt_kurz, text="x-value:", anchor="w").pack(fill="x")
+                x_value = ctk.CTkOptionMenu(inhalt_kurz, values=TGA_ERGEBNIS_SPALTEN_LABELS, fg_color=MUL_TURKIS)
+                x_value.set(TGA_ERGEBNIS_SPALTE_ZU_LABEL.get(zustand[x_key], TGA_ERGEBNIS_SPALTEN_LABELS[0]))
+                x_value.pack(fill="x", pady=(2, 12))
+                ctk.CTkLabel(inhalt_kurz, text="y-value:", anchor="w").pack(fill="x")
+                y_value = ctk.CTkOptionMenu(inhalt_kurz, values=TGA_ERGEBNIS_SPALTEN_LABELS, fg_color=MUL_TURKIS)
+                y_value.set(TGA_ERGEBNIS_SPALTE_ZU_LABEL.get(zustand[y_key], TGA_ERGEBNIS_SPALTEN_LABELS[0]))
+                y_value.pack(fill="x", pady=(2, 12))
+                return titel, x_value, y_value
+
+            titel1, x1, y1 = _diagramm_felder(tab1_kurz, "title_masse", "diagramm1_x_spalte", "diagramm1_y_spalte")
+            titel2, x2, y2 = _diagramm_felder(tab2_kurz, "title_kinetik", "diagramm2_x_spalte", "diagramm2_y_spalte")
+
+            def _uebernehmen_kurz():
+                zustand["title_masse"] = titel1.get().strip() or zustand["title_masse"]
+                zustand["title_kinetik"] = titel2.get().strip() or zustand["title_kinetik"]
+                zustand["diagramm1_x_spalte"] = TGA_ERGEBNIS_LABEL_ZU_SPALTE[x1.get()]
+                zustand["diagramm1_y_spalte"] = TGA_ERGEBNIS_LABEL_ZU_SPALTE[y1.get()]
+                zustand["diagramm2_x_spalte"] = TGA_ERGEBNIS_LABEL_ZU_SPALTE[x2.get()]
+                zustand["diagramm2_y_spalte"] = TGA_ERGEBNIS_LABEL_ZU_SPALTE[y2.get()]
+                zeichne()
+                self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+
+            def _live_plot_settings(_=None):
+                # x/y-Auswahl und Titel ohne zusätzlichen Klick übernehmen.
+                _uebernehmen_kurz()
+
+            for auswahl in (x1, y1, x2, y2):
+                auswahl.configure(command=_live_plot_settings)
+            for titel_feld in (titel1, titel2):
+                titel_feld.bind("<KeyRelease>", _live_plot_settings)
+                titel_feld.bind("<FocusOut>", _live_plot_settings)
+
+            ctk.CTkButton(dialog, text="Übernehmen", fg_color=MUL_TURKIS, command=_uebernehmen_kurz).pack(pady=10)
+            dialog.bind("<Return>", lambda _event: _uebernehmen_kurz())
+            """
+
             dialog = ctk.CTkToplevel(self)
             dialog.title("Diagramm-Einstellungen")
             dialog.geometry("480x720")
@@ -2583,9 +2881,39 @@ class LaborApp(ctk.CTk):
                 zustand["farbskala_min"] = als_zahl_oder_none(eingabe_farbskala_min.get())
                 zustand["farbskala_max"] = als_zahl_oder_none(eingabe_farbskala_max.get())
 
+                neue_linienfarbe = eingabe_linienfarbe.get().strip()
+                if re.fullmatch(r"#[0-9A-Fa-f]{6}", neue_linienfarbe):
+                    zustand["linienfarbe"] = neue_linienfarbe
+                zustand["linienbreite"] = als_zahl_oder_none(eingabe_linienbreite.get()) or zustand["linienbreite"]
+                zustand["schriftgroesse_titel"] = als_zahl_oder_none(eingabe_schrift_titel.get()) or zustand["schriftgroesse_titel"]
+                zustand["schriftgroesse_achsen"] = als_zahl_oder_none(eingabe_schrift_achsen.get()) or zustand["schriftgroesse_achsen"]
+                neuer_hintergrund = eingabe_hintergrund.get().strip()
+                if re.fullmatch(r"#[0-9A-Fa-f]{6}", neuer_hintergrund):
+                    zustand["hintergrund_figure"] = neuer_hintergrund
+
                 zeichne()
-                self.speichere_diagramm_einstellungen(projekt, methode, zustand)
-                dialog.destroy()
+                canvas.draw_idle()
+                _speichern()
+                self._status("Darstellung automatisch gespeichert.", "#00ff88")
+
+            # --- Live anwenden: Werte gelten sofort im Diagramm, OHNE dass
+            # unten auf "Übernehmen" geklickt werden muss. Enter bestätigt
+            # sofort (ohne Debounce), Tippen/Fokuswechsel mit kurzer
+            # Verzögerung, damit nicht bei jedem einzelnen Tastendruck neu
+            # gezeichnet wird.
+            auto_update_auftrag = {"id": None}
+
+            def _sofort_anwenden(*_args):
+                if auto_update_auftrag["id"] is not None:
+                    try:
+                        dialog.after_cancel(auto_update_auftrag["id"])
+                    except Exception:
+                        pass
+                auto_update_auftrag["id"] = dialog.after(30, uebernehmen)
+
+            def _enter_anwenden(_event=None):
+                uebernehmen()
+                return "break"
 
             # WICHTIG: Button-Leiste ZUERST mit side="bottom" packen, damit ihr
             # Platz fest reserviert ist - sonst kann zu viel Inhalt darüber
@@ -2593,10 +2921,58 @@ class LaborApp(ctk.CTk):
             # sichtbaren Bereich drücken und er wirkt "kaputt"/unklickbar.
             button_zeile = ctk.CTkFrame(dialog, fg_color="transparent")
             button_zeile.pack(side="bottom", fill="x", pady=10)
-            ctk.CTkButton(button_zeile, text="Übernehmen", fg_color=MUL_TURKIS, command=uebernehmen).pack()
+            ctk.CTkButton(
+                button_zeile, text="Übernehmen & Vorschau aktualisieren", fg_color=MUL_TURKIS, command=uebernehmen,
+            ).pack()
+            dialog.bind("<Return>", _enter_anwenden)
 
             inhalt = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
             inhalt.pack(fill="both", expand=True, padx=5, pady=(10, 0))
+
+            def _hex_feld(parent, label_text, wert, breite=110, platzhalter="#ffffff"):
+                """Textfeld + 🎨-Knopf: öffnet den System-Farbwähler; sobald
+                dort auf 'OK' gedrückt wird, wird die Farbe SOFORT im
+                Diagramm übernommen (kein zusätzlicher Klick auf
+                'Übernehmen' nötig)."""
+                zeile = ctk.CTkFrame(parent, fg_color="transparent")
+                zeile.pack(fill="x", padx=10, pady=(0, 10))
+                ctk.CTkLabel(zeile, text=label_text, width=breite, anchor="w").pack(side="left")
+                eingabe = ctk.CTkEntry(zeile, placeholder_text=platzhalter)
+                eingabe.insert(0, "" if wert is None else str(wert))
+                eingabe.pack(side="left", padx=(5, 5), fill="x", expand=True)
+
+                def waehle_farbe():
+                    start = eingabe.get().strip() or platzhalter
+                    eltern_fenster = zeile.winfo_toplevel()
+                    war_topmost = False
+                    try:
+                        war_topmost = bool(eltern_fenster.attributes("-topmost"))
+                        if war_topmost:
+                            eltern_fenster.attributes("-topmost", False)
+                    except Exception:
+                        pass
+                    try:
+                        _rgb, hex_code = colorchooser.askcolor(
+                            color=start, title="Farbe wählen", parent=eltern_fenster,
+                        )
+                    except Exception:
+                        hex_code = None
+                    finally:
+                        if war_topmost:
+                            try:
+                                eltern_fenster.attributes("-topmost", True)
+                                eltern_fenster.lift()
+                            except Exception:
+                                pass
+                    if hex_code:
+                        eingabe.delete(0, "end")
+                        eingabe.insert(0, hex_code)
+                        uebernehmen()
+
+                ctk.CTkButton(
+                    zeile, text="🎨", width=32, fg_color=MUL_DUNKEL, hover_color=MUL_TURKIS, command=waehle_farbe,
+                ).pack(side="left")
+                return eingabe
 
             # --- Linkes Diagramm (Höhenverlauf) ---
             header_links = ctk.CTkLabel(
@@ -2704,6 +3080,52 @@ class LaborApp(ctk.CTk):
                 text_color=("gray40", "gray70"), font=("Arial", 10), justify="left",
             ).pack(fill="x", padx=10, pady=(0, 10))
 
+            # --- Trennlinie ---
+            ctk.CTkFrame(inhalt, height=2, fg_color=("gray75", "gray30")).pack(fill="x", padx=10, pady=(5, 15))
+
+            # --- Darstellung: Farbe, Linienbreite, Schrift, Hintergrund ---
+            ctk.CTkLabel(inhalt, text="Darstellung", anchor="w", font=("Arial", 13, "bold")).pack(
+                fill="x", padx=10, pady=(0, 5)
+            )
+            eingabe_linienfarbe = _hex_feld(inhalt, "Linienfarbe:", zustand.get("linienfarbe", MUL_TURKIS))
+
+            zeile_linienbreite = ctk.CTkFrame(inhalt, fg_color="transparent")
+            zeile_linienbreite.pack(fill="x", padx=10, pady=(0, 10))
+            ctk.CTkLabel(zeile_linienbreite, text="Linienbreite:", width=110, anchor="w").pack(side="left")
+            eingabe_linienbreite = ctk.CTkEntry(zeile_linienbreite)
+            eingabe_linienbreite.insert(0, str(zustand.get("linienbreite", 2)))
+            eingabe_linienbreite.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+            zeile_schrift_titel = ctk.CTkFrame(inhalt, fg_color="transparent")
+            zeile_schrift_titel.pack(fill="x", padx=10, pady=(0, 10))
+            ctk.CTkLabel(zeile_schrift_titel, text="Schriftgröße Titel:", width=110, anchor="w").pack(side="left")
+            eingabe_schrift_titel = ctk.CTkEntry(zeile_schrift_titel)
+            eingabe_schrift_titel.insert(0, str(zustand.get("schriftgroesse_titel", 13)))
+            eingabe_schrift_titel.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+            zeile_schrift_achsen = ctk.CTkFrame(inhalt, fg_color="transparent")
+            zeile_schrift_achsen.pack(fill="x", padx=10, pady=(0, 10))
+            ctk.CTkLabel(zeile_schrift_achsen, text="Schriftgröße Achsen:", width=110, anchor="w").pack(side="left")
+            eingabe_schrift_achsen = ctk.CTkEntry(zeile_schrift_achsen)
+            eingabe_schrift_achsen.insert(0, str(zustand.get("schriftgroesse_achsen", 11)))
+            eingabe_schrift_achsen.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+            eingabe_hintergrund = _hex_feld(inhalt, "Hintergrund:", zustand.get("hintergrund_figure", "#ffffff"))
+
+            # Alle Eingabefelder gelten sofort: Enter bestätigt ohne
+            # Verzögerung, Tippen/Fokuswechsel mit kurzer Verzögerung (siehe
+            # _sofort_anwenden oben) - kein Klick auf "Übernehmen" nötig.
+            for eingabe in (
+                eingabe_titel_hoehe, eingabe_y_label, eingabe_x_label, eingabe_x_min, eingabe_x_max,
+                eingabe_y_min, eingabe_y_max, eingabe_titel_form, eingabe_x_label_form, eingabe_y_label_form,
+                eingabe_y_min_form, eingabe_y_max_form, eingabe_farbskala_min, eingabe_farbskala_max,
+                eingabe_linienfarbe, eingabe_linienbreite, eingabe_schrift_titel, eingabe_schrift_achsen,
+                eingabe_hintergrund,
+            ):
+                eingabe.bind("<KeyRelease>", _sofort_anwenden)
+                eingabe.bind("<FocusOut>", _sofort_anwenden)
+                eingabe.bind("<Return>", _enter_anwenden)
+
         dropdown = ctk.CTkOptionMenu(
             seitenleiste, values=anzeige_werte, command=zeige_versuch, fg_color=MUL_TURKIS,
         )
@@ -2767,10 +3189,16 @@ class LaborApp(ctk.CTk):
                 referenz_hoehe = gueltig["sample_height_px"].iloc[0]
                 if referenz_hoehe:
                     hoehe_rel_pct = gueltig["sample_height_px"] / referenz_hoehe * 100
-                    ax_hoehe.plot(gueltig["Temperature"], hoehe_rel_pct, color=MUL_TURKIS, linewidth=2)
-        ax_hoehe.set_xlabel(zustand["label_x"])
-        ax_hoehe.set_ylabel(zustand["label_y"])
-        ax_hoehe.set_title(zustand["title_hoehe"])
+                    ax_hoehe.plot(
+                        gueltig["Temperature"], hoehe_rel_pct,
+                        color=zustand.get("linienfarbe", MUL_TURKIS) or MUL_TURKIS,
+                        linewidth=zustand.get("linienbreite", 2) or 2,
+                    )
+        schriftgroesse_titel = zustand.get("schriftgroesse_titel", 13) or 13
+        schriftgroesse_achsen = zustand.get("schriftgroesse_achsen", 11) or 11
+        ax_hoehe.set_xlabel(zustand["label_x"], fontsize=schriftgroesse_achsen)
+        ax_hoehe.set_ylabel(zustand["label_y"], fontsize=schriftgroesse_achsen)
+        ax_hoehe.set_title(zustand["title_hoehe"], fontsize=schriftgroesse_titel)
         ax_hoehe.set_xlim(left=zustand["x_min"], right=zustand["x_max"])
         ax_hoehe.set_ylim(bottom=zustand["y_min"], top=zustand["y_max"])
         ax_hoehe.grid(True, alpha=0.3)
@@ -2844,14 +3272,22 @@ class LaborApp(ctk.CTk):
 
         # Nur die Beschriftung der Farbskala ist änderbar - die
         # Werte/Skalierung (norm) selbst bleiben fix (siehe oben).
-        farbskala.set_label(zustand["label_x"])
+        farbskala.set_label(zustand["label_x"], fontsize=schriftgroesse_achsen)
 
-        ax_form.set_xlabel(zustand["label_x_form"])
-        ax_form.set_ylabel(zustand["label_y_form"])
-        ax_form.set_title(zustand["title_form"])
+        ax_form.set_xlabel(zustand["label_x_form"], fontsize=schriftgroesse_achsen)
+        ax_form.set_ylabel(zustand["label_y_form"], fontsize=schriftgroesse_achsen)
+        ax_form.set_title(zustand["title_form"], fontsize=schriftgroesse_titel)
         ax_form.grid(True, alpha=0.2)
 
-        fig.tight_layout()
+        # Gemeinsamer Figure-Hintergrund (wie im Darstellung-Dialog gewählt).
+        hintergrund_figure = zustand.get("hintergrund_figure")
+        if hintergrund_figure:
+            fig.patch.set_facecolor(hintergrund_figure)
+            fig.patch.set_alpha(1.0)
+
+        # Grosszuegigerer Abstand zwischen den beiden Diagrammen (Standard-
+        # tight_layout() ohne Padding wirkt zu eng beieinander).
+        fig.tight_layout(w_pad=3.5, pad=1.5)
         canvas.draw_idle()
 
     # ------------------------------------------------------------------
@@ -3009,20 +3445,90 @@ class LaborApp(ctk.CTk):
         button_leiste.grid_columnconfigure(0, weight=1)
         button_leiste.grid_columnconfigure(1, weight=1)
 
-        fig, (ax_masse, ax_kinetik) = plt.subplots(1, 2, figsize=(10, 4.6))
+        def _subplots_fuer_layout(layout):
+            # Die Figure richtet sich nach dem tatsächlich verfügbaren Platz
+            # des Ergebnis-Tabs, statt eine fixe Größe zu erzwingen.
+            haupt_layout.update_idletasks()
+            breite_px = max(plot_frame.winfo_width(), 650)
+            hoehe_px = max(plot_frame.winfo_height() - button_leiste.winfo_height(), 480)
+            dpi = 100
+            if layout == "vertical":
+                # Bei zwei übereinanderliegenden Plots darf die Figure nicht
+                # die komplette (oft sehr breite) Fensterbreite einnehmen.
+                # Die Breite wird deshalb aus der Bildschirmhöhe abgeleitet;
+                # so erhalten beide Diagramme genug Höhe statt gestaucht zu
+                # wirken.
+                bildschirm_hoehe = max(self.winfo_screenheight() - 180, 600)
+                hoehe_px = min(max(hoehe_px, 560), bildschirm_hoehe)
+                breite_px = min(breite_px, int(hoehe_px * 0.95))
+                return plt.subplots(
+                    2, 1, figsize=(breite_px / dpi, hoehe_px / dpi),
+                    gridspec_kw={"hspace": 0.65},
+                )
+            return plt.subplots(1, 2, figsize=(breite_px / dpi, hoehe_px / dpi))
+
+        fig, (ax_masse, ax_kinetik) = _subplots_fuer_layout(
+            zustand.get("diagramm_layout", "horizontal")
+        )
         canvas = FigureCanvasTkAgg(fig, master=plot_frame)
         canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+        def _eintrag_info_fuer(versuch_name):
+            return next(
+                (s, e, p) for s, e, p in verarbeitete_versuche
+                if os.path.splitext(e)[0] == versuch_name
+            )
+
+        def _versuch_schluessel(versuch_name):
+            """Eindeutiger Schluessel dieses Versuchs, unter dem seine
+            individuelle Diagramm-Darstellung gespeichert wird."""
+            if not versuch_name:
+                return None
+            try:
+                _s, _e, voller_pfad = _eintrag_info_fuer(versuch_name)
+            except StopIteration:
+                return versuch_name
+            return self.versuch_schluessel_rohdaten_filter(projekt, voller_pfad)
+
+        def _speichern():
+            """Speichert die aktuelle Darstellung NUR fuer den gerade
+            angezeigten Versuch - Aenderungen an Versuch 1 wirken sich damit
+            nicht mehr automatisch auf andere Versuche aus. Siehe
+            _speichern_fuer_alle() fuer den Button 'Fuer alle Versuche
+            uebernehmen', der bewusst ALLE Versuche auf einmal aktualisiert."""
+            self.speichere_diagramm_einstellungen_fuer_versuch(
+                projekt, methode, _versuch_schluessel(zustand.get("versuch_name")), zustand,
+            )
+
+        def _speichern_fuer_alle():
+            """Uebernimmt die aktuelle Darstellung fuer ALLE Versuche dieser
+            Methode (Button 'Fuer alle Versuche uebernehmen')."""
+            alle_schluessel = [
+                _versuch_schluessel(os.path.splitext(eintrag)[0])
+                for _s, eintrag, _p in verarbeitete_versuche
+            ]
+            self.speichere_diagramm_einstellungen_fuer_alle(projekt, methode, alle_schluessel, zustand)
 
         def zeichne():
             versuch_name = zustand["versuch_name"]
             if not versuch_name:
                 return
-            eintrag_info = next(
-                (s, e, p) for s, e, p in verarbeitete_versuche
-                if os.path.splitext(e)[0] == versuch_name
-            )
+            eintrag_info = _eintrag_info_fuer(versuch_name)
             zustand["_aktueller_raw_data_ordner"] = os.path.dirname(eintrag_info[2])
             self.zeichne_ergebnis_plot_tga(eintrag_info, fig, ax_masse, ax_kinetik, canvas, zustand)
+
+        def setze_layout(layout, speichern=True):
+            """Ersetzt Figure und Canvas vollständig, damit keine alten Achsen überlappen."""
+            nonlocal fig, canvas, ax_masse, ax_kinetik
+            zustand["diagramm_layout"] = layout
+            canvas.get_tk_widget().destroy()
+            plt.close(fig)
+            fig, (ax_masse, ax_kinetik) = _subplots_fuer_layout(layout)
+            canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+            canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            zeichne()
+            if speichern:
+                _speichern()
 
         def speichere_diagrammausschnitt(ax, dateiname_teil):
             versuch_name = zustand["versuch_name"]
@@ -3065,7 +3571,17 @@ class LaborApp(ctk.CTk):
         download_button_rechts.grid(row=0, column=1, sticky="e", padx=(6, 0), pady=(0, 4))
 
         def zeige_versuch(anzeige):
-            zustand["versuch_name"] = anzeige_zu_name.get(anzeige, anzeige)
+            versuch_name = anzeige_zu_name.get(anzeige, anzeige)
+            # Anordnung (horizontal/vertikal) bleibt beim Versuchswechsel wie
+            # aktuell angezeigt bestehen, statt pro Versuch zu "springen".
+            layout_backup = zustand.get("diagramm_layout", "horizontal")
+            neuer_zustand = self.lade_diagramm_einstellungen_fuer_versuch(
+                projekt, methode, _versuch_schluessel(versuch_name), zustand_standard,
+            )
+            neuer_zustand["versuch_name"] = versuch_name
+            neuer_zustand["diagramm_layout"] = layout_backup
+            zustand.clear()
+            zustand.update(neuer_zustand)
             zeichne()
 
         def als_zahl_oder_none(text):
@@ -3188,7 +3704,310 @@ class LaborApp(ctk.CTk):
             dd.pack(side="right")
             return dd
 
+        def oeffne_darstellung():
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("Darstellung")
+            dialog.geometry("420x560")
+            dialog.minsize(360, 380)
+            dialog.attributes("-topmost", True)
+            dialog.lift()
+            dialog.focus_force()
+            inhalt = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+            inhalt.pack(fill="both", expand=True, padx=15, pady=15)
+            ctk.CTkLabel(inhalt, text="Anordnung der Diagramme:", anchor="w").pack(fill="x", pady=(0, 8))
+            layout_labels = {
+                "Horizontal (nebeneinander)": "horizontal",
+                "Vertikal (übereinander)": "vertical",
+            }
+            layout_werte = {wert: label for label, wert in layout_labels.items()}
+
+            def _layout_gewaehlt(_=None):
+                setze_layout(layout_labels.get(layout_dropdown.get(), "horizontal"))
+
+            layout_dropdown = ctk.CTkOptionMenu(
+                inhalt, values=list(layout_labels), fg_color=MUL_TURKIS, command=_layout_gewaehlt,
+            )
+            layout_dropdown.set(layout_werte.get(
+                zustand.get("diagramm_layout", "horizontal"), "Horizontal (nebeneinander)"
+            ))
+            layout_dropdown.pack(fill="x", pady=(0, 12))
+
+            def abschnitt(text):
+                ctk.CTkLabel(inhalt, text=text, anchor="w", font=("Arial", 13, "bold")).pack(
+                    fill="x", pady=(10, 4)
+                )
+
+            def feld(label, wert):
+                ctk.CTkLabel(inhalt, text=label, anchor="w").pack(fill="x")
+                eingabe = ctk.CTkEntry(inhalt)
+                eingabe.insert(0, str(wert))
+                eingabe.pack(fill="x", pady=(2, 8))
+                return eingabe
+
+            abschnitt("Anwenden auf")
+            seiten_auswahl = {
+                "Diagramm 1 (links)": "links",
+                "Diagramm 2 (rechts)": "rechts",
+                "Beide Diagramme": "beide",
+            }
+            seite = ctk.CTkOptionMenu(inhalt, values=list(seiten_auswahl), fg_color=MUL_DUNKEL)
+            seite.set("Beide Diagramme")
+            seite.pack(fill="x", pady=(0, 8))
+
+            abschnitt("Schnellvorlage")
+            stil = ctk.CTkOptionMenu(inhalt, values=PLOT_STIL_NAMEN, fg_color=MUL_TURKIS)
+            stil.set(zustand.get("diagramm_stil_links", "Classic"))
+            stil.pack(fill="x", pady=(0, 8))
+
+            abschnitt("Linie und Schrift")
+            farbe = _hex_feld(inhalt, "Linienfarbe:", zustand["linienfarbe"], bei_aenderung=lambda: _anwendung())
+            linienbreite = feld("Linienbreite:", zustand["linienbreite"])
+            ctk.CTkLabel(inhalt, text="Linienart:", anchor="w").pack(fill="x")
+            linienstil = ctk.CTkOptionMenu(inhalt, values=list(PLOT_LINIENSTIL_LABEL_ZU_WERT), fg_color=MUL_TURKIS)
+            linienstil.set(PLOT_LINIENSTIL_WERT_ZU_LABEL.get(zustand["linienstil_links"], "────"))
+            linienstil.pack(fill="x", pady=(2, 8))
+            titelgroesse = feld("Schriftgroesse Titel:", zustand["schriftgroesse_titel_links"])
+            achsengroesse = feld("Schriftgroesse Achsen:", zustand["schriftgroesse_achsen_links"])
+            tickgroesse = feld("Schriftgroesse Ticks:", zustand["schriftgroesse_ticks_links"])
+            titelfarbe = _hex_feld(inhalt, "Titelfarbe:", zustand.get("schriftfarbe_titel_links", "#000000"), bei_aenderung=lambda: _anwendung())
+
+            abschnitt("Achsen, Hintergrund und Legende")
+            grid = ctk.BooleanVar(value=zustand["gitter_anzeigen_links"])
+            grid_checkbox = ctk.CTkCheckBox(inhalt, text="Gitter anzeigen", variable=grid)
+            grid_checkbox.pack(anchor="w", pady=3)
+            minor_grid = ctk.BooleanVar(value=zustand["minor_grid_anzeigen_links"])
+            minor_grid_checkbox = ctk.CTkCheckBox(inhalt, text="Minor Grid anzeigen", variable=minor_grid)
+            minor_grid_checkbox.pack(anchor="w", pady=3)
+            obere_achse = ctk.BooleanVar(value=zustand["obere_achse_ausblenden_links"])
+            obere_achse_checkbox = ctk.CTkCheckBox(inhalt, text="Obere Achse ausblenden", variable=obere_achse)
+            obere_achse_checkbox.pack(anchor="w", pady=3)
+            rechte_achse = ctk.BooleanVar(value=zustand["rechte_achse_ausblenden_links"])
+            rechte_achse_checkbox = ctk.CTkCheckBox(inhalt, text="Rechte Achse ausblenden", variable=rechte_achse)
+            rechte_achse_checkbox.pack(anchor="w", pady=3)
+            diagramm_hg = _hex_feld(inhalt, "Diagramm-Hintergrund:", zustand["hintergrund_diagramm_links"], bei_aenderung=lambda: _anwendung())
+            figure_hg = _hex_feld(inhalt, "Gesamter Hintergrund:", zustand["hintergrund_figure"], bei_aenderung=lambda: _anwendung())
+            legende = ctk.BooleanVar(value=zustand["legende_anzeigen_links"])
+            legende_checkbox = ctk.CTkCheckBox(inhalt, text="Legende anzeigen", variable=legende)
+            legende_checkbox.pack(anchor="w", pady=3)
+
+            abschnitt("Download")
+            dpi = ctk.CTkOptionMenu(inhalt, values=["150", "300", "600", "1200"], fg_color=MUL_TURKIS)
+            dpi.set(str(zustand.get("export_dpi", 300)))
+            dpi.pack(fill="x", pady=(2, 5))
+            dateiformat = ctk.CTkOptionMenu(inhalt, values=["png", "pdf", "svg"], fg_color=MUL_TURKIS)
+            dateiformat.set(zustand.get("export_format", "png"))
+            dateiformat.pack(fill="x", pady=(2, 8))
+            transparent = ctk.BooleanVar(value=bool(zustand.get("transparenter_hintergrund", False)))
+            transparent_checkbox = ctk.CTkCheckBox(inhalt, text="Transparenter Hintergrund beim Download", variable=transparent)
+            transparent_checkbox.pack(anchor="w", pady=3)
+
+            def _seiten():
+                auswahl = seiten_auswahl[seite.get()]
+                return ["links", "rechts"] if auswahl == "beide" else [auswahl]
+
+            def _anwendung():
+                for s in _seiten():
+                    suffix = s
+                    neue_linienfarbe = farbe.get().strip()
+                    if re.fullmatch(r"#[0-9A-Fa-f]{6}", neue_linienfarbe):
+                        zustand["linienfarbe" if s == "links" else "linienfarbe2"] = neue_linienfarbe
+                    zustand["linienbreite" if s == "links" else "linienbreite2"] = als_zahl_oder_none(linienbreite.get()) or 1.5
+                    zustand[f"linienstil_{suffix}"] = PLOT_LINIENSTIL_LABEL_ZU_WERT.get(linienstil.get(), "-")
+                    zustand[f"schriftgroesse_titel_{suffix}"] = als_zahl_oder_none(titelgroesse.get()) or 13
+                    zustand[f"schriftgroesse_achsen_{suffix}"] = als_zahl_oder_none(achsengroesse.get()) or 11
+                    zustand[f"schriftgroesse_ticks_{suffix}"] = als_zahl_oder_none(tickgroesse.get()) or 10
+                    neue_titelfarbe = titelfarbe.get().strip()
+                    if re.fullmatch(r"#[0-9A-Fa-f]{6}", neue_titelfarbe):
+                        zustand[f"schriftfarbe_titel_{suffix}"] = neue_titelfarbe
+                    zustand[f"gitter_anzeigen_{suffix}"] = bool(grid.get())
+                    zustand[f"minor_grid_anzeigen_{suffix}"] = bool(minor_grid.get())
+                    zustand[f"obere_achse_ausblenden_{suffix}"] = bool(obere_achse.get())
+                    zustand[f"rechte_achse_ausblenden_{suffix}"] = bool(rechte_achse.get())
+                    neuer_diagramm_hg = diagramm_hg.get().strip()
+                    if re.fullmatch(r"#[0-9A-Fa-f]{6}", neuer_diagramm_hg):
+                        zustand[f"hintergrund_diagramm_{suffix}"] = neuer_diagramm_hg
+                    zustand[f"legende_anzeigen_{suffix}"] = bool(legende.get())
+                neuer_figure_hg = figure_hg.get().strip()
+                if re.fullmatch(r"#[0-9A-Fa-f]{6}", neuer_figure_hg):
+                    zustand["hintergrund_figure"] = neuer_figure_hg
+                zustand["export_dpi"] = int(float(dpi.get()))
+                zustand["export_format"] = dateiformat.get()
+                zustand["transparenter_hintergrund"] = bool(transparent.get())
+                zeichne()
+                canvas.draw()
+                _speichern()
+                self._status("Darstellung automatisch gespeichert (nur dieser Versuch).", "#00ff88")
+
+            auto_update_auftrag = {"id": None}
+
+            def _sofort_anwenden(*_args):
+                """Erst nach Abschluss des Klick-/Dropdown-Events zeichnen.
+                Das stellt sicher, dass etwa ein gerade angeklicktes Grid auch
+                wirklich mit seinem neuen Wert in der Vorschau landet."""
+                if auto_update_auftrag["id"] is not None:
+                    try:
+                        dialog.after_cancel(auto_update_auftrag["id"])
+                    except Exception:
+                        pass
+                auto_update_auftrag["id"] = dialog.after(30, _anwendung)
+
+            def _enter_anwenden(_event=None):
+                # Enter bestätigt ohne Verzögerung und verhindert, dass das
+                # Eingabefeld die Aktion anschließend wieder überschreibt.
+                _anwendung()
+                return "break"
+
+            def _setze_feld(eingabe, wert):
+                eingabe.delete(0, "end")
+                eingabe.insert(0, str(wert))
+
+            def _lade_seitenwerte(_=None):
+                """Zeigt beim Wechsel die bereits gespeicherten individuellen Werte."""
+                s = "rechts" if seiten_auswahl[seite.get()] == "rechts" else "links"
+                _setze_feld(farbe, zustand["linienfarbe2" if s == "rechts" else "linienfarbe"])
+                _setze_feld(linienbreite, zustand["linienbreite2" if s == "rechts" else "linienbreite"])
+                linienstil.set(PLOT_LINIENSTIL_WERT_ZU_LABEL.get(zustand[f"linienstil_{s}"], next(iter(PLOT_LINIENSTIL_LABEL_ZU_WERT))))
+                _setze_feld(titelgroesse, zustand[f"schriftgroesse_titel_{s}"])
+                _setze_feld(achsengroesse, zustand[f"schriftgroesse_achsen_{s}"])
+                _setze_feld(tickgroesse, zustand[f"schriftgroesse_ticks_{s}"])
+                _setze_feld(titelfarbe, zustand.get(f"schriftfarbe_titel_{s}", "#000000"))
+                grid.set(bool(zustand[f"gitter_anzeigen_{s}"]))
+                minor_grid.set(bool(zustand[f"minor_grid_anzeigen_{s}"]))
+                obere_achse.set(bool(zustand[f"obere_achse_ausblenden_{s}"]))
+                rechte_achse.set(bool(zustand[f"rechte_achse_ausblenden_{s}"]))
+                _setze_feld(diagramm_hg, zustand[f"hintergrund_diagramm_{s}"])
+                legende.set(bool(zustand[f"legende_anzeigen_{s}"]))
+                stil.set(zustand.get(f"diagramm_stil_{s}", "Classic"))
+
+            def _stil_anwenden(_=None):
+                preset = PLOT_STIL_PRESETS.get(stil.get(), {})
+                for s in _seiten():
+                    zustand[f"diagramm_stil_{s}"] = stil.get()
+                    for schluessel, wert in preset.items():
+                        if schluessel == "hintergrund_figure":
+                            zustand[schluessel] = wert
+                        elif schluessel in ("gitter_anzeigen", "minor_grid_anzeigen", "obere_achse_ausblenden", "rechte_achse_ausblenden", "tick_richtung", "hintergrund_diagramm"):
+                            zustand[f"{schluessel}_{s}"] = wert
+                _lade_seitenwerte()
+                zeichne()
+                canvas.draw()
+                _speichern()
+
+            # Auswahlfelder gelten sofort: Vorschau und spätere Downloads
+            # verwenden ohne weiteren Klick denselben gespeicherten Zustand.
+            seite.configure(command=_lade_seitenwerte)
+            stil.configure(command=_stil_anwenden)
+            linienstil.configure(command=lambda _=None: _anwendung())
+            dpi.configure(command=lambda _=None: _anwendung())
+            dateiformat.configure(command=lambda _=None: _anwendung())
+            for checkbox in (grid_checkbox, minor_grid_checkbox, obere_achse_checkbox,
+                             rechte_achse_checkbox, legende_checkbox, transparent_checkbox):
+                checkbox.configure(command=_anwendung)
+
+            for eingabe in (farbe, linienbreite, titelgroesse, achsengroesse,
+                            tickgroesse, titelfarbe, diagramm_hg, figure_hg):
+                eingabe.bind("<FocusOut>", _sofort_anwenden)
+                eingabe.bind("<Return>", _enter_anwenden)
+                eingabe.bind("<KeyRelease>", _sofort_anwenden)
+
+            def _fuer_alle_uebernehmen():
+                if not messagebox.askyesno(
+                    "Für alle übernehmen",
+                    "Die aktuelle Darstellung wird für ALLE "
+                    f"{len(verarbeitete_versuche)} Versuche dieser Methode "
+                    "übernommen und überschreibt dabei auch bereits "
+                    "individuell abweichend eingestellte Werte einzelner "
+                    "Versuche.\n\nFortfahren?",
+                    parent=dialog,
+                ):
+                    return
+                _anwendung()
+                _speichern_fuer_alle()
+                self._status("Darstellung für alle Versuche übernommen.", "#00ff88")
+
+            ctk.CTkButton(inhalt, text="Übernehmen & Vorschau aktualisieren", fg_color=MUL_TURKIS, command=_anwendung).pack(fill="x", pady=(12, 4))
+            ctk.CTkButton(
+                inhalt, text="Für alle Versuche übernehmen", fg_color="transparent",
+                border_width=1, border_color=MUL_TURKIS, command=_fuer_alle_uebernehmen,
+            ).pack(fill="x", pady=(0, 4))
+            dialog.bind("<Return>", _enter_anwenden)
+
         def oeffne_settings():
+            """Nur Titel sowie x-/y-Werte der beiden Diagramme bearbeiten."""
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("Plot Settings")
+            dialog.geometry("400x480")
+            dialog.minsize(360, 420)
+            dialog.resizable(True, True)
+            dialog.attributes("-topmost", True)
+            dialog.lift()
+            dialog.focus_force()
+            tabs_kurz = ctk.CTkTabview(dialog, fg_color="transparent")
+            tabs_kurz.pack(fill="both", expand=True, padx=5, pady=(10, 0))
+
+            def _diagramm_felder(parent_tab, titel_key, x_key, y_key):
+                inhalt_kurz = ctk.CTkFrame(parent_tab, fg_color="transparent")
+                inhalt_kurz.pack(fill="both", expand=True, padx=10, pady=10)
+                ctk.CTkLabel(inhalt_kurz, text="Titel:", anchor="w").pack(fill="x")
+                titel = ctk.CTkEntry(inhalt_kurz)
+                titel.insert(0, zustand[titel_key])
+                titel.pack(fill="x", pady=(2, 12))
+                ctk.CTkLabel(inhalt_kurz, text="x-value:", anchor="w").pack(fill="x")
+                x_value = ctk.CTkOptionMenu(inhalt_kurz, values=TGA_ERGEBNIS_SPALTEN_LABELS, fg_color=MUL_TURKIS)
+                x_value.set(TGA_ERGEBNIS_SPALTE_ZU_LABEL.get(zustand[x_key], TGA_ERGEBNIS_SPALTEN_LABELS[0]))
+                x_value.pack(fill="x", pady=(2, 12))
+                ctk.CTkLabel(inhalt_kurz, text="y-value:", anchor="w").pack(fill="x")
+                y_value = ctk.CTkOptionMenu(inhalt_kurz, values=TGA_ERGEBNIS_SPALTEN_LABELS, fg_color=MUL_TURKIS)
+                y_value.set(TGA_ERGEBNIS_SPALTE_ZU_LABEL.get(zustand[y_key], TGA_ERGEBNIS_SPALTEN_LABELS[0]))
+                y_value.pack(fill="x", pady=(2, 12))
+                return titel, x_value, y_value
+
+            titel1, x1, y1 = _diagramm_felder(tabs_kurz.add("Diagramm 1"), "title_masse", "diagramm1_x_spalte", "diagramm1_y_spalte")
+            titel2, x2, y2 = _diagramm_felder(tabs_kurz.add("Diagramm 2"), "title_kinetik", "diagramm2_x_spalte", "diagramm2_y_spalte")
+
+            def _uebernehmen_kurz():
+                zustand["title_masse"] = titel1.get().strip() or zustand["title_masse"]
+                zustand["title_kinetik"] = titel2.get().strip() or zustand["title_kinetik"]
+                zustand["diagramm1_x_spalte"] = TGA_ERGEBNIS_LABEL_ZU_SPALTE[x1.get()]
+                zustand["diagramm1_y_spalte"] = TGA_ERGEBNIS_LABEL_ZU_SPALTE[y1.get()]
+                zustand["diagramm2_x_spalte"] = TGA_ERGEBNIS_LABEL_ZU_SPALTE[x2.get()]
+                zustand["diagramm2_y_spalte"] = TGA_ERGEBNIS_LABEL_ZU_SPALTE[y2.get()]
+                zeichne()
+                _speichern()
+                self._status("Plot-Einstellungen automatisch gespeichert (nur dieser Versuch).", "#00ff88")
+
+            def _live_plot_settings(_=None):
+                _uebernehmen_kurz()
+
+            def _fuer_alle_uebernehmen_kurz():
+                if not messagebox.askyesno(
+                    "Für alle übernehmen",
+                    "Titel und x-/y-Werte werden für ALLE "
+                    f"{len(verarbeitete_versuche)} Versuche dieser Methode "
+                    "übernommen und überschreiben dabei auch bereits "
+                    "individuell abweichend eingestellte Werte einzelner "
+                    "Versuche.\n\nFortfahren?",
+                    parent=dialog,
+                ):
+                    return
+                _uebernehmen_kurz()
+                _speichern_fuer_alle()
+                self._status("Plot-Einstellungen für alle Versuche übernommen.", "#00ff88")
+
+            for auswahl in (x1, y1, x2, y2):
+                auswahl.configure(command=_live_plot_settings)
+            for titel_feld in (titel1, titel2):
+                titel_feld.bind("<KeyRelease>", _live_plot_settings)
+                titel_feld.bind("<FocusOut>", _live_plot_settings)
+
+            ctk.CTkButton(dialog, text="Übernehmen", fg_color=MUL_TURKIS, command=_uebernehmen_kurz).pack(pady=(10, 4))
+            ctk.CTkButton(
+                dialog, text="Für alle Versuche übernehmen", fg_color="transparent",
+                border_width=1, border_color=MUL_TURKIS, command=_fuer_alle_uebernehmen_kurz,
+            ).pack(pady=(0, 10))
+            dialog.bind("<Return>", lambda _event: _uebernehmen_kurz())
+            return
+
             dialog = ctk.CTkToplevel(self)
             dialog.title("Plot Settings")
             dialog.geometry("480x560")
@@ -3336,6 +4155,32 @@ class LaborApp(ctk.CTk):
             # ==============================================================
             inhalt = ctk.CTkScrollableFrame(tab_darstellung, fg_color="transparent")
             inhalt.pack(fill="both", expand=True)
+
+            # Die Anordnung gehoert zu den Plot Settings. Die Auswahl wird
+            # direkt angewandt und gespeichert, damit die Änderung sofort in
+            # der Vorschau sichtbar ist.
+            _abschnitt(inhalt, "Anordnung der Diagramme")
+            ctk.CTkLabel(inhalt, text="Darstellung:", anchor="w").pack(fill="x", padx=10)
+            layout_labels = {
+                "Horizontal (nebeneinander)": "horizontal",
+                "Vertikal (übereinander)": "vertical",
+            }
+            layout_werte = {wert: label for label, wert in layout_labels.items()}
+
+            def _layout_gewaehlt(_=None):
+                setze_layout(layout_labels.get(layout_dropdown.get(), "horizontal"))
+
+            layout_dropdown = ctk.CTkOptionMenu(
+                inhalt, values=list(layout_labels), fg_color=MUL_TURKIS,
+                command=_layout_gewaehlt,
+            )
+            layout_dropdown.set(
+                layout_werte.get(
+                    zustand.get("diagramm_layout", "horizontal"),
+                    "Horizontal (nebeneinander)",
+                )
+            )
+            layout_dropdown.pack(fill="x", padx=10, pady=(2, 10))
 
             # --- Diagrammstil (Preset: Grid/Achsen/Tick/Hintergrund je Achse) ---
             _abschnitt(inhalt, "Diagrammstil")
@@ -3546,6 +4391,34 @@ class LaborApp(ctk.CTk):
             hg_seite_dd.configure(command=_hg_laden)
             _hg_laden()
             eingabe_hg_figure = _hex_feld(inhalt, "Gesamter Hintergrund:", zustand["hintergrund_figure"])
+
+            def _stil_gewechselt(_=None):
+                """Synct die Achsen-Checkboxen/-Dropdowns sofort mit dem
+                gewaehlten Diagrammstil-Preset (z.B. 'Minimal' -> Grid aus),
+                DAMIT beim spaeteren 'Übernehmen' die Achsen-Sektion (die
+                gitter_anzeigen_var/minor_grid_var/... unconditionally liest)
+                nicht die noch alte Checkbox-Stellung wieder zurückschreibt
+                und den Preset-Effekt so aufhebt."""
+                preset = PLOT_STIL_PRESETS.get(stil_dropdown.get(), {})
+                if "gitter_anzeigen" in preset:
+                    gitter_anzeigen_var.set(preset["gitter_anzeigen"])
+                if "minor_grid_anzeigen" in preset:
+                    minor_grid_var.set(preset["minor_grid_anzeigen"])
+                if "obere_achse_ausblenden" in preset:
+                    obere_achse_var.set(preset["obere_achse_ausblenden"])
+                if "rechte_achse_ausblenden" in preset:
+                    rechte_achse_var.set(preset["rechte_achse_ausblenden"])
+                if "tick_richtung" in preset:
+                    tick_richtung_dropdown.set(
+                        PLOT_TICK_RICHTUNG_WERT_ZU_LABEL.get(
+                            preset["tick_richtung"], tick_richtung_dropdown.get()
+                        )
+                    )
+                if "hintergrund_diagramm" in preset:
+                    eingabe_hg_diagramm.delete(0, "end")
+                    eingabe_hg_diagramm.insert(0, str(preset["hintergrund_diagramm"]))
+
+            stil_dropdown.configure(command=_stil_gewechselt)
 
             # --- Legende ---
             _abschnitt(inhalt, "Legende")
@@ -3766,6 +4639,10 @@ class LaborApp(ctk.CTk):
             seitenleiste, text="Plot Settings", fg_color=MUL_DUNKEL, command=oeffne_settings,
         ).pack(fill="x")
 
+        ctk.CTkButton(
+            seitenleiste, text="Darstellung", fg_color=MUL_DUNKEL, command=oeffne_darstellung,
+        ).pack(fill="x", pady=(8, 0))
+
         zeige_versuch(anzeige_werte[0])
 
     def _tga_auf_eafd_basis(self, dm_pct, dmdt_pctmin, cao_pct):
@@ -3818,10 +4695,17 @@ class LaborApp(ctk.CTk):
         "rechts" (Diagramm 2/Kinetik), passend zu den Feldnamen aus
         zustand_standard (z.B. "gitter_anzeigen_links").
         """
-        ax.grid(
-            bool(zustand.get(f"gitter_anzeigen_{seite}", True)),
-            which="major", alpha=0.3,
-        )
+        gitter_an = bool(zustand.get(f"gitter_anzeigen_{seite}", True))
+        if gitter_an:
+            # WICHTIG: die Style-Kwargs (alpha/color/linewidth) duerfen NUR
+            # zusammen mit True uebergeben werden. matplotlib ignoriert bei
+            # ax.grid(False, ..., color=..., alpha=..., linewidth=...) das
+            # False und schaltet das Grid trotzdem wieder EIN (mit Warnung
+            # "The grid will be enabled") - deshalb blieb das Grid bisher
+            # auch beim "Minimal"-Preset oder deaktivierter Checkbox sichtbar.
+            ax.grid(True, which="major", alpha=0.5, color="#888888", linewidth=0.7)
+        else:
+            ax.grid(False, which="major")
         if bool(zustand.get(f"minor_grid_anzeigen_{seite}", False)):
             ax.minorticks_on()
             ax.grid(True, which="minor", alpha=0.15)
@@ -3856,6 +4740,85 @@ class LaborApp(ctk.CTk):
             loc = PLOT_LEGENDE_LABEL_ZU_LOC.get(position, "upper right")
             ax.legend(handles, labels, loc=loc, frameon=False, fontsize=8)
 
+    def _tga_lies_startgewicht_mg(self, voller_pfad):
+        """
+        Liest die Ausgangsmasse ("Startgewicht") aus der '# Weight: ... mg'-
+        Kopfzeile der rohen TGA-.txt-Datei, z.B.:
+            # Weight: 375.5 mg
+        Diese Ausgangsmasse steht NICHT im Ergebnis-Parquet, wird aber
+        gebraucht, um aus einer relativen Massenangabe [%] eine absolute
+        Masse [mg] zu berechnen (siehe _tga_ergaenze_absolute_massenspalten).
+        Gibt None zurueck, falls keine solche Kopfzeile gefunden wird.
+        """
+        if not voller_pfad or not os.path.isfile(voller_pfad):
+            return None
+        gewicht_pattern = re.compile(r"Weight:\s*([0-9]+[.,]?[0-9]*)\s*mg", re.IGNORECASE)
+        try:
+            with open(voller_pfad, encoding="ISO-8859-1") as f:
+                for zeile in f:
+                    if zeile.startswith("#"):
+                        treffer = gewicht_pattern.search(zeile)
+                        if treffer:
+                            try:
+                                return float(treffer.group(1).replace(",", "."))
+                            except ValueError:
+                                return None
+                    elif not zeile.startswith("#"):
+                        # Kopfzeilen sind vorbei (Datenteil/Spaltenkopf beginnt) -
+                        # nicht die ganze (potenziell sehr grosse) Datei einlesen.
+                        break
+        except OSError:
+            return None
+        return None
+
+    # Paare (fehlende absolute Spalte -> vorhandene relative %-Spalte), aus
+    # denen sich die absolute Spalte mit der Ausgangsmasse nachrechnen laesst.
+    _TGA_ABSOLUTE_MASSE_PAARE = (
+        ("m_filtered_mg", "dm_filtered_pct"),
+        ("m_original_mg", "dm_original_pct"),
+    )
+    _TGA_ABSOLUTE_KINETIK_PAARE = (
+        ("dmdt_filtered_mgmin", "dmdt_filtered_pctmin"),
+        ("dmdt_original_mgmin", "dmdt_original_pctmin"),
+    )
+
+    def _tga_ergaenze_absolute_massenspalten(self, df, voller_pfad):
+        """
+        Ergaenzt fehlende absolute Massen-/Kinetik-Spalten (z.B.
+        m_filtered_mg, dmdt_filtered_mgmin) im DataFrame, FALLS die
+        zugehoerige relative %-Spalte vorhanden ist, die absolute Spalte
+        selbst aber fehlt (z.B. weil processed_data nur die relativen
+        Werte enthaelt). Dafuer wird die Ausgangsmasse aus dem
+        Rohdaten-Header gelesen (siehe _tga_lies_startgewicht_mg):
+            m_mg        = startgewicht_mg * (dm_pct / 100)
+            dmdt_mgmin  = startgewicht_mg * (dmdt_pctmin / 100)
+        Bereits vorhandene Spalten werden NICHT ueberschrieben. Aendert df
+        in-place und gibt es zurueck (unveraendert, falls keine Ausgangs-
+        masse gefunden wird oder nichts fehlt).
+        """
+        fehlt_masse = any(
+            ziel not in df.columns and quelle in df.columns
+            for ziel, quelle in self._TGA_ABSOLUTE_MASSE_PAARE
+        )
+        fehlt_kinetik = any(
+            ziel not in df.columns and quelle in df.columns
+            for ziel, quelle in self._TGA_ABSOLUTE_KINETIK_PAARE
+        )
+        if not (fehlt_masse or fehlt_kinetik):
+            return df
+
+        startgewicht_mg = self._tga_lies_startgewicht_mg(voller_pfad)
+        if not startgewicht_mg:
+            return df
+
+        for ziel_spalte, pct_spalte in self._TGA_ABSOLUTE_MASSE_PAARE:
+            if ziel_spalte not in df.columns and pct_spalte in df.columns:
+                df[ziel_spalte] = startgewicht_mg * (df[pct_spalte] / 100.0)
+        for ziel_spalte, pctmin_spalte in self._TGA_ABSOLUTE_KINETIK_PAARE:
+            if ziel_spalte not in df.columns and pctmin_spalte in df.columns:
+                df[ziel_spalte] = startgewicht_mg * (df[pctmin_spalte] / 100.0)
+        return df
+
     def zeichne_ergebnis_plot_tga(self, eintrag_info, fig, ax_masse, ax_kinetik, canvas, zustand):
         """
         Zeichnet Diagramm 1 (links) und Diagramm 2 (rechts) fuer einen
@@ -3870,6 +4833,7 @@ class LaborApp(ctk.CTk):
         import numpy as np
         import pandas as pd
 
+
         staub, eintrag, voller_pfad = eintrag_info
         df = self.lade_ergebnis_dataframe(eintrag, voller_pfad)
 
@@ -3881,6 +4845,11 @@ class LaborApp(ctk.CTk):
             ax_kinetik.text(0.5, 0.5, "Konnte processed_data nicht laden.", ha="center", va="center")
             canvas.draw_idle()
             return
+
+        # Fehlende absolute Massen-/Kinetik-Spalten (z.B. m_filtered_mg)
+        # aus der relativen %-Spalte + Startgewicht der Rohdaten nachrechnen,
+        # falls processed_data nur die relativen Werte enthaelt.
+        df = self._tga_ergaenze_absolute_massenspalten(df, voller_pfad)
 
         sheet_name = self._tga_versuchsname_fuer_sheet(eintrag)
         tga_parameter = self.hole_tga_parameter_fuer_versuch(sheet_name)
@@ -3942,17 +4911,22 @@ class LaborApp(ctk.CTk):
             return y_label
 
         y_label_masse = werte_fuer(
-            ax_masse, zustand["diagramm1_x_spalte"], zustand["diagramm1_y_spalte"], zustand["label_y_masse"],
+            ax_masse, zustand["diagramm1_x_spalte"], zustand["diagramm1_y_spalte"],
+            tga_achsen_label_fuer_spalte(zustand["diagramm1_y_spalte"]),
             zustand["linienfarbe"], zustand["linienbreite"], zustand["linienstil_links"],
             "links", ist_kinetik_seite=False,
         )
         y_label_kinetik = werte_fuer(
-            ax_kinetik, zustand["diagramm2_x_spalte"], zustand["diagramm2_y_spalte"], zustand["label_y_kinetik"],
+            ax_kinetik, zustand["diagramm2_x_spalte"], zustand["diagramm2_y_spalte"],
+            tga_achsen_label_fuer_spalte(zustand["diagramm2_y_spalte"]),
             zustand["linienfarbe2"], zustand["linienbreite2"], zustand["linienstil_rechts"],
             "rechts", ist_kinetik_seite=True,
         )
 
-        ax_masse.set_xlabel(zustand["label_x_masse"], fontsize=zustand.get("schriftgroesse_achsen_links", 11))
+        ax_masse.set_xlabel(
+            tga_achsen_label_fuer_spalte(zustand["diagramm1_x_spalte"]),
+            fontsize=zustand.get("schriftgroesse_achsen_links", 11),
+        )
         ax_masse.set_ylabel(y_label_masse, fontsize=zustand.get("schriftgroesse_achsen_links", 11))
         ax_masse.set_title(
             zustand["title_masse"], fontsize=zustand.get("schriftgroesse_titel_links", 13),
@@ -3961,7 +4935,10 @@ class LaborApp(ctk.CTk):
         self._tga_style_achse(ax_masse, "links", zustand)
         self._tga_zeige_legende(ax_masse, "links", zustand)
 
-        ax_kinetik.set_xlabel(zustand["label_x_kinetik"], fontsize=zustand.get("schriftgroesse_achsen_rechts", 11))
+        ax_kinetik.set_xlabel(
+            tga_achsen_label_fuer_spalte(zustand["diagramm2_x_spalte"]),
+            fontsize=zustand.get("schriftgroesse_achsen_rechts", 11),
+        )
         ax_kinetik.set_ylabel(y_label_kinetik, fontsize=zustand.get("schriftgroesse_achsen_rechts", 11))
         ax_kinetik.set_title(
             zustand["title_kinetik"], fontsize=zustand.get("schriftgroesse_titel_rechts", 13),
@@ -3980,7 +4957,12 @@ class LaborApp(ctk.CTk):
             fig.patch.set_facecolor(zustand.get("hintergrund_figure", "#ffffff") or "#ffffff")
 
         if bool(zustand.get("tight_layout", True)):
-            fig.tight_layout()
+            # Vertikale Darstellung braucht auf Laptop-Bildschirmen etwas
+            # mehr Luft zwischen Titel/X-Achse und dem nächsten Diagramm.
+            if zustand.get("diagramm_layout") == "vertical":
+                fig.tight_layout(h_pad=4.5, pad=1.5)
+            else:
+                fig.tight_layout()
         canvas.draw_idle()
 
     # ------------------------------------------------------------------

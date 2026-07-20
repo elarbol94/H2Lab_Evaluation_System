@@ -254,6 +254,20 @@ def tga_achsen_label_fuer_spalte(spalte):
     label = TGA_ERGEBNIS_SPALTE_ZU_LABEL.get(spalte, spalte)
     return TGA_ACHSEN_LABELS.get(label, str(label))
 
+# ------------------------------------------------------------------
+# SEM: Elemente/Operatoren fuer die Filter-Sektion im Rohdaten-Tab
+# (siehe baue_rohdaten_tab_sem). Elementkuerzel muessen zu den Dateinamen
+# der Elementkarten-TIFs passen ("Montaged Map Data-<Element> At#...tif" -
+# siehe _sem_lade_elementkarten). Liste bei Bedarf um weitere im Labor
+# gemessene Elemente ergaenzen.
+SEM_FILTER_ELEMENTE = (
+    "C", "O", "Al", "Si", "Ca", "Fe", "Mg", "Mn", "Zn", "Na", "K",
+    "Cl", "S", "Ti", "Cr", "Cu", "Ni", "Pb", "P", "V", "F",
+)
+SEM_FILTER_OPERATOREN = ("<", "<=", ">", ">=")
+# Ein Default-Filter, analog zum in der Aufgabenstellung genannten Beispiel "C < 30".
+SEM_FILTER_STANDARD_LISTE = [{"element": "C", "operator": "<", "wert": 30.0, "aktiv": True}]
+
 # Optional: anderer Python-Interpreter für die EMI-Berechnung (falls HSMTools
 # in einer eigenen venv installiert ist, nicht in der venv der GUI-App).
 # Kann alternativ auch als Umgebungsvariable HSMTOOLS_PYTHON gesetzt werden.
@@ -630,6 +644,96 @@ class LaborApp(ctk.CTk):
                     "tmax": _wert("tmax"),
                     "operator": _wert("operator"),
                     "mass_loss_scale_pct": _wert("mass_loss_scale_pct"),
+                }
+
+        return None
+
+    def hole_sem_parameter_fuer_versuch(self, versuch_name):
+        """
+        SEM-Gegenstück zu hole_emi_parameter_fuer_versuch / hole_tga_parameter_fuer_versuch.
+
+        WICHTIGER UNTERSCHIED zu EMI/TGA: dort wird über die Spalte "Messung"
+        gematcht (M-Code, z.B. "M2602270903"). Die SEM-Rohdaten-Ordner sind
+        aber nicht so benannt, sondern wie die allgemeine Proben-"id" im
+        Metadaten-Bereich ganz am Anfang der Zeile (z.B. "RT1", "RT63",
+        "RT74" - siehe wetransfer-Lieferung: Ordner "RT63", "RT74"). Deshalb
+        wird hier über die Spalte "id" gematcht, NICHT über "Messung".
+        "Messung" wird nur noch benutzt, um (wie bei EMI/TGA) die Kopfzeile
+        im Sheet zu finden (dort zuverlässig vorhanden).
+
+        Liest:
+          - Material/Kommentar (allgemeiner Metadaten-Bereich, wie bei EMI/TGA)
+          - SEM-spezifische Settings-Spalten aus dem Block "SEM Preperation" /
+            "SEM Evaluation" (NUR in den Spalten NACH "Messung" gesucht,
+            analog zu TGA, damit keine gleichnamige Spalte aus einem anderen
+            Methoden-Block fälschlich gefunden wird):
+            SEM id, Box N°, embedded by, polished by, overview by, detail by
+        Alle Spaltennamen werden tolerant gesucht. Gibt ein Dict zurück,
+        oder None, wenn keine passende Zeile gefunden wurde.
+        """
+        header_index, header = self.finde_header_zeile("Messung")
+        if header is None:
+            return None
+
+        spalten_index = {}
+        # Match-Spalte: die allgemeine "id"-Spalte (NICHT "Messung" - siehe
+        # Docstring). Exakter Vergleich auf "id", damit "Project id",
+        # "Box ID", "SEM  id" etc. nicht fälschlich treffen.
+        for i, spalte in enumerate(header):
+            if str(spalte).strip().lower() == "id":
+                spalten_index["id"] = i
+                break
+        if "id" not in spalten_index:
+            return None
+
+        for name in ("material", "comment (lime addition)"):
+            for i, spalte in enumerate(header):
+                if str(spalte).strip().lower() == name:
+                    spalten_index[name] = i
+                    break
+
+        # "Messung" brauchen wir nur, um NACH dieser Spalte zu suchen (SEM-
+        # Block kommt im Sheet nach "EMI Settings"/"Messung") - analog zum
+        # TGA-Vorgehen.
+        m_idx = None
+        for i, spalte in enumerate(header):
+            if str(spalte).strip().lower() == "messung":
+                m_idx = i
+                break
+        if m_idx is None:
+            m_idx = spalten_index["id"]
+
+        sem_settings_kandidaten = {
+            "sem_id": ("sem id", "sem  id", "sem-id", "semid"),
+            "box_n": ("box n°", "box no", "box nr", "box nr.", "box number", "box n"),
+            "embedded_by": ("embedded by",),
+            "polished_by": ("polished by",),
+            "overview_by": ("overview by",),
+            "detail_by": ("detail by",),
+        }
+        for ziel_name, kandidaten in sem_settings_kandidaten.items():
+            for i in range(m_idx + 1, len(header)):
+                if str(header[i]).strip().lower() in kandidaten:
+                    spalten_index[ziel_name] = i
+                    break
+
+        ziel_normalisiert = self.normalisiere_id(versuch_name)
+        id_idx = spalten_index["id"]
+        for zeile in self.aktuelle_sheet_daten[header_index + 1:]:
+            if len(zeile) > id_idx and self.normalisiere_id(zeile[id_idx]) == ziel_normalisiert:
+                def _wert(spalten_name):
+                    idx = spalten_index.get(spalten_name)
+                    return zeile[idx] if idx is not None and len(zeile) > idx else ""
+
+                return {
+                    "material": _wert("material"),
+                    "kommentar": _wert("comment (lime addition)"),
+                    "sem_id": _wert("sem_id"),
+                    "box_n": _wert("box_n"),
+                    "embedded_by": _wert("embedded_by"),
+                    "polished_by": _wert("polished_by"),
+                    "overview_by": _wert("overview_by"),
+                    "detail_by": _wert("detail_by"),
                 }
 
         return None
@@ -1245,6 +1349,11 @@ class LaborApp(ctk.CTk):
                 "Versuch", "Material", "Kommentar (Lime addition)", "TGA ID",
                 "Gas", "Tmax", "Operator", "Mass Loss Scale [%]", "CaO [%]",
             ]
+        elif methode == "SEM":
+            spalten = [
+                "Versuch", "Material", "Kommentar (Lime addition)", "SEM ID",
+                "Box N°", "embedded by", "polished by", "overview by", "detail by",
+            ]
         else:
             spalten = ["Versuch", "Info"]
 
@@ -1290,6 +1399,25 @@ class LaborApp(ctk.CTk):
                     ]
                 else:
                     werte = [versuch_name, "-", "-", "-", "-", "-", "-", "-", "-"]
+            elif methode == "SEM":
+                # SEM-Rohdaten-Ordner heißen wie die allgemeine Proben-"id"
+                # im Sheet (z.B. "RT74"), keine Nummer-Präfix/Suffix-Logik
+                # wie bei TGA nötig - versuch_name direkt verwenden.
+                sem_parameter = self.hole_sem_parameter_fuer_versuch(versuch_name)
+                if sem_parameter:
+                    werte = [
+                        versuch_name,
+                        sem_parameter["material"],
+                        sem_parameter["kommentar"],
+                        sem_parameter["sem_id"],
+                        sem_parameter["box_n"],
+                        sem_parameter["embedded_by"],
+                        sem_parameter["polished_by"],
+                        sem_parameter["overview_by"],
+                        sem_parameter["detail_by"],
+                    ]
+                else:
+                    werte = [versuch_name, "-", "-", "-", "-", "-", "-", "-", "-"]
             else:
                 werte = [versuch_name, "Für diese Methode noch keine Sheet-Anbindung."]
 
@@ -1307,6 +1435,9 @@ class LaborApp(ctk.CTk):
         und einen 'Berechnen'-Button unten rechts."""
         if methode == "TGA":
             self.baue_rohdaten_tab_tga(parent, projekt, methode)
+            return
+        if methode == "SEM":
+            self.baue_rohdaten_tab_sem(parent, projekt, methode)
             return
 
         versuche = self.liste_versuche(projekt, methode)
@@ -2439,6 +2570,556 @@ class LaborApp(ctk.CTk):
             border_color=MUL_TURKIS,
             command=fuer_alle_uebernehmen,
         ).pack(fill="x", pady=(8, 0))
+
+        # --- Ersten Versuch automatisch auswaehlen ---
+        waehle_versuch(versuche[0][2])
+
+    # ------------------------------------------------------------------
+    # SEM: Rohdaten laden (Elementkarten-TIFs), normieren, filtern,
+    # Cluster-Umrisse berechnen - siehe baue_rohdaten_tab_sem fuer die UI.
+    # ------------------------------------------------------------------
+    def _sem_finde_tif_ordner(self, versuch_pfad):
+        """
+        Sucht den Ordner mit den Elementkarten-TIFs zu einem SEM-Versuch.
+        Erwartete Struktur (siehe wetransfer-Lieferung): <Versuch>/TIF/*.tif
+        Falls kein "TIF"-Unterordner existiert, wird der Versuchsordner
+        selbst durchsucht (Fallback, falls die TIFs direkt dort liegen).
+        """
+        if os.path.isfile(versuch_pfad):
+            return os.path.dirname(versuch_pfad)
+        for eintrag in os.listdir(versuch_pfad):
+            if eintrag.lower() == "tif" and os.path.isdir(os.path.join(versuch_pfad, eintrag)):
+                return os.path.join(versuch_pfad, eintrag)
+        return versuch_pfad
+
+    def _sem_finde_backscatter_pfad(self, versuch_pfad):
+        """
+        Sucht ein Backscatter-/Übersichtsbild fuer das "Ausgangsbild" (linkes
+        Diagramm) - bevorzugt den vom sem_filter_app-Cache erzeugten
+        registrierten Backscatter-TIF (.sem_filter_cache/...), sonst ein
+        TIF mit "backscatter" im Dateinamen im TIF-Ordner.
+        """
+        cache_ordner = os.path.join(versuch_pfad, ".sem_filter_cache")
+        if os.path.isdir(cache_ordner):
+            for eintrag in sorted(os.listdir(cache_ordner)):
+                if eintrag.lower().endswith(".tif") and "backscatter" in eintrag.lower():
+                    return os.path.join(cache_ordner, eintrag)
+        tif_ordner = self._sem_finde_tif_ordner(versuch_pfad)
+        if os.path.isdir(tif_ordner):
+            for eintrag in sorted(os.listdir(tif_ordner)):
+                if eintrag.lower().endswith(".tif") and "backscatter" in eintrag.lower():
+                    return os.path.join(tif_ordner, eintrag)
+        return None
+
+    def _sem_lade_elementkarten(self, versuch_pfad):
+        """
+        Liest alle Elementkarten-TIFs eines SEM-Versuchs ein
+        ("Montaged Map Data-<Element> At#...tif") und gibt ein Dict
+        Element -> 2D-numpy-Array zurueck. Das "EDS Layered Image" (RGB-
+        Komposit, kein Elementkanal) wird separat als moegliches
+        Ausgangsbild zurueckgegeben, nicht als Element.
+        Gibt (elementkarten_dict, eds_layered_pfad) zurueck.
+        """
+        from PIL import Image
+        import numpy as np
+
+        tif_ordner = self._sem_finde_tif_ordner(versuch_pfad)
+        elementkarten = {}
+        eds_layered_pfad = None
+        if not os.path.isdir(tif_ordner):
+            return elementkarten, eds_layered_pfad
+
+        element_muster = re.compile(r"Data-([A-Za-z]{1,2})\s*At", re.IGNORECASE)
+        for eintrag in sorted(os.listdir(tif_ordner)):
+            if not eintrag.lower().endswith(".tif"):
+                continue
+            pfad = os.path.join(tif_ordner, eintrag)
+            if "eds layered image" in eintrag.lower():
+                eds_layered_pfad = pfad
+                continue
+            treffer = element_muster.search(eintrag)
+            if not treffer:
+                continue
+            element = treffer.group(1).capitalize()
+            try:
+                with Image.open(pfad) as bild:
+                    elementkarten[element] = np.asarray(bild, dtype=np.float64)
+            except Exception as e:
+                print(f"[SEM TIF Fehler] {pfad}: {e}")
+        return elementkarten, eds_layered_pfad
+
+    def _sem_lade_ausgangsbild(self, versuch_pfad, elementkarten, eds_layered_pfad):
+        """
+        Waehlt/laedt das Bild fuer das linke ("Ausgangsbild"-)Diagramm:
+        bevorzugt Backscatter-Übersicht, sonst das EDS-Layered-Komposit,
+        sonst (Fallback) die Summe aller Elementkarten als Graustufenbild.
+        Gibt (bild_array, ist_farbig) zurueck, oder (None, False).
+        """
+        from PIL import Image
+        import numpy as np
+
+        backscatter_pfad = self._sem_finde_backscatter_pfad(versuch_pfad)
+        for pfad, ist_kandidat_farbig in ((backscatter_pfad, False), (eds_layered_pfad, True)):
+            if not pfad:
+                continue
+            try:
+                with Image.open(pfad) as bild:
+                    array = np.asarray(bild)
+                return array, (array.ndim == 3)
+            except Exception as e:
+                print(f"[SEM Ausgangsbild Fehler] {pfad}: {e}")
+
+        if elementkarten:
+            summe = np.sum(np.stack(list(elementkarten.values()), axis=0), axis=0)
+            return summe, False
+        return None, False
+
+    def _sem_normalisiere_elementkarten(self, elementkarten):
+        """
+        Normiert die Elementkarten auf Prozent-Basis je Pixel (Summe aller
+        Elemente an diesem Pixel = 100%), damit unterschiedliche
+        Gesamt-Signalstaerken zwischen Versuchen vergleichbar werden
+        ("Größe normiert, damit vergleichbar") - Portierung der Kernidee aus
+        SEM/filtering.py:compute_normalized_element_maps, ohne die dortigen
+        Zusatzabhaengigkeiten (cv2/zarr/h5py).
+        """
+        import numpy as np
+
+        if not elementkarten:
+            return {}
+        gesamt = np.sum(np.stack(list(elementkarten.values()), axis=0), axis=0)
+        normiert = {}
+        for element, karte in elementkarten.items():
+            werte = np.zeros_like(karte, dtype=np.float64)
+            np.divide(karte * 100.0, gesamt, out=werte, where=gesamt > 0.0)
+            werte[~np.isfinite(werte)] = 0.0
+            normiert[element] = werte
+        return normiert
+
+    def _sem_wende_filter_an(self, karten, filter_liste):
+        """
+        Wendet die (aktiven) Schwellwert-Filter der Filter-Sektion nacheinander
+        per UND auf die Elementkarten an (z.B. "C < 30" AND "O > 5" ...) und
+        liefert die finale boolesche Maske zurueck. Analog zur in
+        SEM/FILTERING_EXPLANATION.md beschriebenen Logik.
+        """
+        import numpy as np
+
+        if not karten:
+            return None
+        form = next(iter(karten.values())).shape
+        maske = np.ones(form, dtype=bool)
+        for eintrag in filter_liste:
+            if not eintrag.get("aktiv", True):
+                continue
+            element = eintrag.get("element")
+            karte = karten.get(element)
+            if karte is None:
+                continue
+            operator = eintrag.get("operator", "<")
+            try:
+                wert = float(eintrag.get("wert", 0))
+            except (TypeError, ValueError):
+                continue
+            if operator == "<":
+                vergleich = karte < wert
+            elif operator == "<=":
+                vergleich = karte <= wert
+            elif operator == ">":
+                vergleich = karte > wert
+            elif operator == ">=":
+                vergleich = karte >= wert
+            else:
+                continue
+            maske &= vergleich
+        return maske
+
+    def _sem_berechne_cluster(self, maske):
+        """
+        Clustert die gefilterten (maske=True) Pixel ueber
+        zusammenhaengende-Komponenten-Labeling (scipy.ndimage.label) - ein
+        Standard-Clusteralgorithmus fuer räumliche Regionen. Gibt
+        (labels_array, anzahl_cluster) zurueck; (None, 0) falls scipy fehlt
+        oder die Maske leer ist.
+        """
+        try:
+            from scipy import ndimage
+        except ImportError:
+            return None, 0
+        if maske is None or not maske.any():
+            return None, 0
+        labels, anzahl = ndimage.label(maske)
+        return labels, anzahl
+
+    def zeichne_rohdaten_vorschau_sem(self, voller_pfad, fig, achsen, canvas, zustand):
+        """
+        Zeichnet die 2 Diagramme des SEM-Rohdaten-Tabs neu: links das
+        Ausgangsbild, rechts das gefilterte Bild inkl. Cluster-Umrissen
+        (falls aktiviert). `zustand` enthaelt die Filter-Sektion
+        (zustand["filter"]), sowie "normieren" und "cluster_anzeigen".
+        """
+        import numpy as np
+
+        ax_links, ax_rechts = achsen
+        ax_links.clear()
+        ax_rechts.clear()
+
+        elementkarten, eds_layered_pfad = self._sem_lade_elementkarten(voller_pfad)
+        ausgangsbild, ist_farbig = self._sem_lade_ausgangsbild(voller_pfad, elementkarten, eds_layered_pfad)
+
+        ax_links.set_title("Ausgangsbild")
+        if ausgangsbild is not None:
+            if ist_farbig:
+                ax_links.imshow(ausgangsbild)
+            else:
+                ax_links.imshow(ausgangsbild, cmap="gray")
+        else:
+            ax_links.text(0.5, 0.5, "Keine Rohdaten (TIF) gefunden", ha="center", va="center")
+        ax_links.set_xticks([])
+        ax_links.set_yticks([])
+
+        ax_rechts.set_title("Gefiltert" + (" + Cluster-Umrisse" if zustand.get("cluster_anzeigen", True) else ""))
+        if not elementkarten:
+            ax_rechts.text(0.5, 0.5, "Keine Elementkarten (TIF) gefunden", ha="center", va="center")
+            ax_rechts.set_xticks([])
+            ax_rechts.set_yticks([])
+            canvas.draw()
+            return
+
+        karten = self._sem_normalisiere_elementkarten(elementkarten) if zustand.get("normieren", True) else elementkarten
+        maske = self._sem_wende_filter_an(karten, zustand.get("filter", []))
+
+        if ausgangsbild is not None and ist_farbig:
+            basis_grau = np.mean(np.asarray(ausgangsbild, dtype=np.float64)[..., :3], axis=-1)
+        elif ausgangsbild is not None:
+            basis_grau = np.asarray(ausgangsbild, dtype=np.float64)
+        else:
+            basis_grau = np.sum(np.stack(list(elementkarten.values()), axis=0), axis=0)
+
+        gefiltert_anzeige = np.array(basis_grau, dtype=np.float64, copy=True)
+        if maske is not None and maske.shape == basis_grau.shape:
+            gefiltert_anzeige[~maske] = np.nan
+        ax_rechts.imshow(basis_grau, cmap="gray", alpha=0.35)
+        ax_rechts.imshow(gefiltert_anzeige, cmap="viridis")
+
+        anzahl_cluster = 0
+        if maske is not None and zustand.get("cluster_anzeigen", True):
+            _labels, anzahl_cluster = self._sem_berechne_cluster(maske)
+            try:
+                # Umrisse aller (auch mehrerer getrennter) Cluster in einem
+                # Zug: contour() zeichnet an der 0.5-Hoehenlinie die Grenze
+                # jeder zusammenhaengenden True-Region der Maske.
+                ax_rechts.contour(
+                    maske.astype(np.float64), levels=[0.5], colors="red", linewidths=1.2
+                )
+            except Exception as e:
+                print(f"[SEM Umriss Fehler] {e}")
+
+        retained_pct = float(np.mean(maske)) * 100.0 if maske is not None else 0.0
+        ax_rechts.set_xlabel(f"behalten: {retained_pct:.1f} % | Cluster: {anzahl_cluster}")
+        ax_rechts.set_xticks([])
+        ax_rechts.set_yticks([])
+
+        fig.tight_layout()
+        canvas.draw()
+
+    def baue_rohdaten_tab_sem(self, parent, projekt, methode):
+        """
+        SEM-Gegenstueck zu baue_rohdaten_tab_tga: links die Versuchsliste,
+        in der Mitte 2 Diagramme nebeneinander (links Ausgangsbild, rechts
+        gefiltertes Bild mit Cluster-Umrissen), rechts die Filter-Sektion
+        (dynamische Liste von Schwellwert-Filtern wie "C < 30", per UND
+        kombiniert - siehe SEM_FILTER_ELEMENTE/_sem_wende_filter_an) sowie
+        Schalter fuer Normierung und Cluster-Umrisse. Einstellungen werden
+        wie bei TGA pro Versuch gespeichert (lade_/speichere_
+        rohdaten_filter_einstellungen_fuer_versuch).
+        """
+        versuche = self.liste_versuche(projekt, methode)
+        if not versuche:
+            ctk.CTkLabel(parent, text="Keine lokalen Rohdaten gefunden.").pack(pady=20)
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        except ImportError:
+            ctk.CTkLabel(
+                parent,
+                text="matplotlib ist nicht installiert - 'pip install matplotlib' im GUI-Environment noetig.",
+                wraplength=560,
+            ).pack(pady=20)
+            return
+
+        zustand_standard = {
+            "filter": [dict(f) for f in SEM_FILTER_STANDARD_LISTE],
+            "normieren": True,
+            "cluster_anzeigen": True,
+        }
+        zustand = self.lade_rohdaten_filter_einstellungen_fuer_versuch(
+            projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, versuche[0][2]), zustand_standard
+        )
+        if not zustand.get("filter"):
+            zustand["filter"] = [dict(f) for f in SEM_FILTER_STANDARD_LISTE]
+
+        haupt_layout = ctk.CTkFrame(parent, fg_color="transparent")
+        haupt_layout.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # --- Linke Spalte: Versuchsliste (analog TGA, ohne Verarb.-Haekchen -
+        # fuer SEM gibt es noch kein *_calculation.py-Skript) ---
+        linke_breite_merker = {"breite": 260}
+        linke_spalte = ctk.CTkFrame(haupt_layout, fg_color="transparent", width=linke_breite_merker["breite"])
+        linke_spalte.pack(side="left", fill="y", padx=(0, 0))
+        linke_spalte.pack_propagate(False)
+
+        kopfzeile = ctk.CTkFrame(linke_spalte, fg_color="transparent")
+        kopfzeile.pack(side="top", fill="x", padx=5, pady=(0, 5))
+        links_einklapp_btn = ctk.CTkButton(kopfzeile, text="◀", width=32, fg_color="transparent", border_width=1)
+        links_einklapp_btn.pack(side="left")
+
+        inhalt_links = ctk.CTkFrame(linke_spalte, fg_color="transparent")
+        inhalt_links.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(inhalt_links, text="Versuche", font=("Arial", 12, "bold")).pack(
+            side="top", anchor="w", padx=10, pady=(0, 5)
+        )
+        scroll = ctk.CTkScrollableFrame(inhalt_links, width=220)
+        scroll.pack(padx=0, pady=(0, 5), fill="both", expand=True)
+
+        griff_links = ctk.CTkFrame(haupt_layout, width=6, fg_color=("gray70", "gray25"), cursor="sb_h_double_arrow")
+        griff_links.pack(side="left", fill="y", padx=(4, 8))
+        self._mache_griff_ziehbar(griff_links, linke_spalte, linke_breite_merker, minimum=90, maximum=650, invertiert=False)
+        self._mache_spalte_einklappbar(
+            links_einklapp_btn, linke_spalte, inhalt_links, linke_breite_merker,
+            eingeklappt_text="◀", ausgeklappt_text="▶", breite_eingeklappt=48,
+        )
+
+        ausgewaehlter_pfad = {"wert": None}
+        zeilen_frames = []
+        aktualisiere_filter_panel = {"fn": None}
+
+        def waehle_versuch(voller_pfad):
+            ausgewaehlter_pfad["wert"] = voller_pfad
+            for zeile, pfad in zeilen_frames:
+                zeile.configure(fg_color=MUL_TURKIS if pfad == voller_pfad else "transparent")
+            zustand.clear()
+            zustand.update(
+                self.lade_rohdaten_filter_einstellungen_fuer_versuch(
+                    projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, voller_pfad), zustand_standard
+                )
+            )
+            if not zustand.get("filter"):
+                zustand["filter"] = [dict(f) for f in SEM_FILTER_STANDARD_LISTE]
+            if aktualisiere_filter_panel["fn"]:
+                aktualisiere_filter_panel["fn"]()
+            zeichne()
+
+        for _staub, eintrag, voller_pfad in versuche:
+            zeile = ctk.CTkFrame(scroll, fg_color="transparent")
+            zeile.pack(fill="x", pady=2)
+            label = ctk.CTkLabel(zeile, text=os.path.splitext(eintrag)[0], anchor="w")
+            label.pack(side="left", padx=5, fill="x", expand=True)
+            zeilen_frames.append((zeile, voller_pfad))
+            for widget in (zeile, label):
+                widget.bind("<Button-1>", lambda _e, p=voller_pfad: waehle_versuch(p))
+
+        # --- Mitte: 2 Diagramme nebeneinander (Ausgangsbild | gefiltert) ---
+        mitte = ctk.CTkFrame(haupt_layout, fg_color="transparent")
+        mitte.pack(side="left", fill="both", expand=True, padx=(0, 0))
+
+        figsize = self._dynamische_figsize(mitte, 2, 1, mindest_breite_px=650, mindest_hoehe_px=420)
+        fig, achsen_zeile = plt.subplots(1, 2, figsize=figsize)
+        achsen = (achsen_zeile[0], achsen_zeile[1])
+        canvas = FigureCanvasTkAgg(fig, master=mitte)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        def zeichne():
+            pfad = ausgewaehlter_pfad["wert"]
+            if not pfad:
+                return
+            self.zeichne_rohdaten_vorschau_sem(pfad, fig, achsen, canvas, zustand)
+
+        # --- Rechts: Filter-Sektion (dynamische Liste) + Normierung/Cluster ---
+        rechte_breite_merker = {"breite": 340}
+        griff_rechts = ctk.CTkFrame(haupt_layout, width=6, fg_color=("gray70", "gray25"), cursor="sb_h_double_arrow")
+        griff_rechts.pack(side="left", fill="y", padx=(8, 4))
+
+        rechte_container = ctk.CTkFrame(haupt_layout, fg_color="transparent", width=rechte_breite_merker["breite"])
+        rechte_container.pack(side="left", fill="y")
+        rechte_container.pack_propagate(False)
+
+        rechte_kopfzeile = ctk.CTkFrame(rechte_container, fg_color="transparent")
+        rechte_kopfzeile.pack(side="top", fill="x", padx=(5, 0), pady=(0, 5))
+        rechts_einklapp_btn = ctk.CTkButton(
+            rechte_kopfzeile, text="▶", width=32, fg_color="transparent", border_width=1
+        )
+        rechts_einklapp_btn.pack(side="left")
+
+        rechte_spalte = ctk.CTkScrollableFrame(rechte_container, fg_color="transparent")
+        rechte_spalte.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(
+            rechte_spalte, text="Filter-Sektion", font=("Arial", 14, "bold")
+        ).pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(
+            rechte_spalte,
+            text="Schwellwert-Filter auf normierte Elementanteile, z.B. C < 30. "
+                 "Werden per UND kombiniert (alle aktiven Filter muessen zutreffen).",
+            font=("Arial", 10), text_color=("gray30", "gray70"),
+            anchor="w", justify="left", wraplength=290,
+        ).pack(fill="x", padx=10, pady=(0, 10))
+
+        self._mache_griff_ziehbar(
+            griff_rechts, rechte_container, rechte_breite_merker, minimum=200, maximum=650, invertiert=True
+        )
+        self._mache_spalte_einklappbar(
+            rechts_einklapp_btn, rechte_container, rechte_spalte, rechte_breite_merker,
+            eingeklappt_text="▶", ausgeklappt_text="◀", breite_eingeklappt=48,
+        )
+
+        filter_liste_frame = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+        filter_liste_frame.pack(fill="x", padx=0, pady=(0, 5))
+
+        def _uebernimm_zeilen_in_zustand():
+            """Liest die aktuellen Filter-Zeilen-Widgets in zustand['filter'] ein."""
+            neue_liste = []
+            for eintrag in filter_zeilen_widgets:
+                try:
+                    wert = float(eintrag["wert_entry"].get().strip().replace(",", "."))
+                except ValueError:
+                    wert = eintrag["daten"].get("wert", 0)
+                neue_liste.append({
+                    "element": eintrag["element_dropdown"].get(),
+                    "operator": eintrag["operator_dropdown"].get(),
+                    "wert": wert,
+                    "aktiv": bool(eintrag["aktiv_var"].get()),
+                })
+            zustand["filter"] = neue_liste
+
+        filter_zeilen_widgets = []
+
+        def baue_filter_zeilen():
+            for kind in filter_liste_frame.winfo_children():
+                kind.destroy()
+            filter_zeilen_widgets.clear()
+
+            for index, eintrag in enumerate(zustand.get("filter", [])):
+                zeile = ctk.CTkFrame(filter_liste_frame, fg_color=("gray90", "gray20"))
+                zeile.pack(fill="x", padx=10, pady=4)
+
+                aktiv_var = ctk.BooleanVar(value=eintrag.get("aktiv", True))
+                ctk.CTkCheckBox(zeile, text="", variable=aktiv_var, width=20).pack(side="left", padx=(6, 2))
+
+                element_werte = list(SEM_FILTER_ELEMENTE)
+                if eintrag.get("element") not in element_werte:
+                    element_werte = [eintrag.get("element", "C")] + element_werte
+                element_dropdown = ctk.CTkOptionMenu(zeile, values=element_werte, width=70, fg_color=MUL_TURKIS)
+                element_dropdown.set(eintrag.get("element", "C"))
+                element_dropdown.pack(side="left", padx=2)
+
+                operator_dropdown = ctk.CTkOptionMenu(
+                    zeile, values=list(SEM_FILTER_OPERATOREN), width=55, fg_color=MUL_TURKIS
+                )
+                operator_dropdown.set(eintrag.get("operator", "<"))
+                operator_dropdown.pack(side="left", padx=2)
+
+                wert_entry = ctk.CTkEntry(zeile, width=70)
+                wert_entry.insert(0, str(eintrag.get("wert", 0)))
+                wert_entry.pack(side="left", padx=2)
+                wert_entry.bind("<Return>", lambda _e: uebernehmen())
+
+                def _entfernen(i=index):
+                    _uebernimm_zeilen_in_zustand()
+                    del zustand["filter"][i]
+                    baue_filter_zeilen()
+                    uebernehmen()
+
+                ctk.CTkButton(
+                    zeile, text="✕", width=28, fg_color="transparent",
+                    hover_color="#aa3333", command=_entfernen,
+                ).pack(side="right", padx=(2, 6))
+
+                filter_zeilen_widgets.append({
+                    "daten": eintrag, "aktiv_var": aktiv_var,
+                    "element_dropdown": element_dropdown, "operator_dropdown": operator_dropdown,
+                    "wert_entry": wert_entry,
+                })
+
+        def _filter_hinzufuegen():
+            _uebernimm_zeilen_in_zustand()
+            zustand["filter"].append({"element": "O", "operator": ">", "wert": 5.0, "aktiv": True})
+            baue_filter_zeilen()
+
+        ctk.CTkButton(
+            rechte_spalte, text="+ Filter hinzufügen", fg_color="transparent",
+            border_width=1, border_color=MUL_TURKIS, command=_filter_hinzufuegen,
+        ).pack(fill="x", padx=10, pady=(0, 15))
+
+        ctk.CTkFrame(rechte_spalte, height=2, fg_color=("gray75", "gray30")).pack(fill="x", padx=10, pady=(0, 10))
+
+        normieren_var = ctk.BooleanVar(value=zustand.get("normieren", True))
+        ctk.CTkCheckBox(
+            rechte_spalte, text="Elementanteile normieren (Summe = 100 %, vergleichbar)",
+            variable=normieren_var,
+        ).pack(fill="x", padx=10, pady=(0, 8))
+
+        cluster_var = ctk.BooleanVar(value=zustand.get("cluster_anzeigen", True))
+        ctk.CTkCheckBox(
+            rechte_spalte, text="Umrisse via Clusteralgorithmus anzeigen",
+            variable=cluster_var,
+        ).pack(fill="x", padx=10, pady=(0, 15))
+
+        def uebernehmen():
+            _uebernimm_zeilen_in_zustand()
+            zustand["normieren"] = bool(normieren_var.get())
+            zustand["cluster_anzeigen"] = bool(cluster_var.get())
+            pfad = ausgewaehlter_pfad["wert"]
+            if pfad:
+                self.speichere_rohdaten_filter_einstellungen_fuer_versuch(
+                    projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, pfad), zustand
+                )
+            zeichne()
+
+        def fuer_alle_uebernehmen():
+            if not messagebox.askyesno(
+                "Für alle übernehmen",
+                "Die aktuelle Filter-Sektion wird für ALLE "
+                f"{len(versuche)} Versuche dieser Methode übernommen und "
+                "überschreibt dabei auch bereits individuell abweichend "
+                "eingestellte Werte einzelner Versuche.\n\nFortfahren?",
+            ):
+                return
+            _uebernimm_zeilen_in_zustand()
+            zustand["normieren"] = bool(normieren_var.get())
+            zustand["cluster_anzeigen"] = bool(cluster_var.get())
+            alle_schluessel = [
+                self.versuch_schluessel_rohdaten_filter(projekt, voller_pfad)
+                for _staub, _eintrag, voller_pfad in versuche
+            ]
+            self.speichere_rohdaten_filter_einstellungen_fuer_alle(projekt, methode, alle_schluessel, zustand)
+            zeichne()
+
+        def _aktualisiere_filter_panel_impl():
+            normieren_var.set(zustand.get("normieren", True))
+            cluster_var.set(zustand.get("cluster_anzeigen", True))
+            baue_filter_zeilen()
+
+        aktualisiere_filter_panel["fn"] = _aktualisiere_filter_panel_impl
+
+        button_leiste_filter = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+        button_leiste_filter.pack(fill="x", padx=10, pady=(0, 15))
+        ctk.CTkButton(
+            button_leiste_filter, text="Übernehmen", fg_color=MUL_TURKIS, command=uebernehmen
+        ).pack(fill="x")
+        ctk.CTkButton(
+            button_leiste_filter,
+            text="Für alle übernehmen",
+            fg_color="transparent",
+            border_width=1,
+            border_color=MUL_TURKIS,
+            command=fuer_alle_uebernehmen,
+        ).pack(fill="x", pady=(8, 0))
+
+        baue_filter_zeilen()
 
         # --- Ersten Versuch automatisch auswaehlen ---
         waehle_versuch(versuche[0][2])

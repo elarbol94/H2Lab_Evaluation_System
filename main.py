@@ -268,6 +268,16 @@ SEM_FILTER_OPERATOREN = ("<", "<=", ">", ">=")
 # Ein Default-Filter, analog zum in der Aufgabenstellung genannten Beispiel "C < 30".
 SEM_FILTER_STANDARD_LISTE = [{"element": "C", "operator": "<", "wert": 30.0, "aktiv": True}]
 
+# Default-Farbpalette fuer die Element-Faerbung im Ergebnisse-Tab (siehe
+# baue_ergebnisse_tab_sem) - wird der Reihe nach an neu auftauchende Elemente
+# vergeben (zyklisch, falls mehr Elemente als Farben vorhanden sind). Danach
+# frei per Farbauswahl-Dialog aenderbar, Auswahl bleibt projektweit gespeichert.
+SEM_ELEMENT_FARBPALETTE = (
+    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#bfef45", "#fabed4", "#469990",
+    "#dcbeff", "#9a6324", "#800000", "#aaffc3", "#000075",
+)
+
 # Optional: anderer Python-Interpreter für die EMI-Berechnung (falls HSMTools
 # in einer eigenen venv installiert ist, nicht in der venv der GUI-App).
 # Kann alternativ auch als Umgebungsvariable HSMTOOLS_PYTHON gesetzt werden.
@@ -3147,6 +3157,10 @@ class LaborApp(ctk.CTk):
             self.baue_ergebnisse_tab_tga(parent, projekt, methode)
             return
 
+        if methode == "SEM":
+            self.baue_ergebnisse_tab_sem(parent, projekt, methode)
+            return
+
         if methode != "EMI":
             ctk.CTkLabel(
                 parent, text="Ergebnisdarstellung ist aktuell nur für EMI und TGA verfügbar."
@@ -3970,6 +3984,614 @@ class LaborApp(ctk.CTk):
         # tight_layout() ohne Padding wirkt zu eng beieinander).
         fig.tight_layout(w_pad=3.5, pad=1.5)
         canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # TAB: ERGEBNISSE (SEM) - Elementkarten durchklicken, je Element eigene
+    # frei waehlbare Farbe (Farbauswahl-Dialog), als Overlay uebereinander.
+    # ------------------------------------------------------------------
+    def _sem_farbe_hex_zu_rgb(self, hex_wert):
+        """'#rrggbb' -> (r, g, b) als Floats 0..1."""
+        hex_wert = str(hex_wert or "#ffffff").lstrip("#")
+        if len(hex_wert) != 6:
+            hex_wert = "ffffff"
+        return tuple(int(hex_wert[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+    def _sem_stelle_element_zustand_sicher(self, zustand, elemente):
+        """
+        Ergaenzt in zustand['element_farben']/['element_sichtbar'] fehlende
+        Eintraege fuer neu aufgetauchte Elemente (Default-Farbe zyklisch aus
+        SEM_ELEMENT_FARBPALETTE, standardmaessig sichtbar=True). Bereits
+        vorhandene (z.B. vom Nutzer geaenderte) Eintraege bleiben unangetastet.
+        """
+        zustand.setdefault("element_farben", {})
+        zustand.setdefault("element_sichtbar", {})
+        for element in elemente:
+            if element not in zustand["element_farben"]:
+                index = len(zustand["element_farben"]) % len(SEM_ELEMENT_FARBPALETTE)
+                zustand["element_farben"][element] = SEM_ELEMENT_FARBPALETTE[index]
+            if element not in zustand["element_sichtbar"]:
+                zustand["element_sichtbar"][element] = True
+
+    def _sem_baue_overlay_bild(self, elementkarten, zustand, karten_prozent=None):
+        """
+        Baut das farbige Overlay-Bild: jede sichtbare Elementkarte wird auf
+        [0, 1] skaliert (robust, per 99. Perzentil statt Maximum - schuetzt
+        vor Ausreissern) und mit ihrer zugewiesenen Farbe additiv in ein
+        RGB-Bild gemischt, danach auf [0, 1] geclippt.
+
+        `karten_prozent` (optional): die auf Prozent normierten Elementkarten
+        (siehe _sem_normalisiere_elementkarten). Ist zustand["mindestanteil"]
+        > 0 gesetzt (Filter-Schieberegler im Ergebnisse-Tab), werden Pixel,
+        an denen ein Element WENIGER als dieser Prozentsatz zur lokalen
+        Zusammensetzung beitraegt, fuer genau dieses Element ausgeblendet -
+        so laesst sich z.B. "nur Bereiche mit >= 20% Kupfer" einblenden.
+        """
+        import numpy as np
+
+        if not elementkarten:
+            return None
+        form = next(iter(elementkarten.values())).shape
+        rgb = np.zeros((*form, 3), dtype=np.float64)
+        irgendeins_sichtbar = False
+        mindestanteil = float(zustand.get("mindestanteil", 0.0) or 0.0)
+        for element, karte in elementkarten.items():
+            if not zustand.get("element_sichtbar", {}).get(element, True):
+                continue
+            irgendeins_sichtbar = True
+            skala = float(np.percentile(karte, 99)) or 1.0
+            karte_norm = np.clip(karte / skala, 0.0, 1.0)
+            if mindestanteil > 0.0 and karten_prozent is not None and element in karten_prozent:
+                karte_norm = np.where(karten_prozent[element] >= mindestanteil, karte_norm, 0.0)
+            farbe = self._sem_farbe_hex_zu_rgb(zustand.get("element_farben", {}).get(element, "#ffffff"))
+            for kanal in range(3):
+                rgb[..., kanal] += karte_norm * farbe[kanal]
+        if not irgendeins_sichtbar:
+            return np.zeros((*form, 3), dtype=np.float64)
+        return np.clip(rgb, 0.0, 1.0)
+
+    def baue_ergebnisse_tab_sem(self, parent, projekt, methode):
+        """
+        SEM-Gegenstueck zu baue_ergebnisse_tab (EMI)/baue_ergebnisse_tab_tga:
+        links Versuchsauswahl, in der Mitte ein grosses Overlay-Diagramm
+        (alle aktivierten Elementkarten uebereinander, je eigene Farbe),
+        rechts die Element-Liste zum "Durchklicken" - pro Element eine
+        Sichtbar-Checkbox + Farbauswahl-Button (oeffnet den System-
+        Farbwaehler, siehe tkinter.colorchooser). Die Element->Farbe/
+        Sichtbar-Zuordnung ist projektweit (nicht pro Versuch) gespeichert,
+        wie die uebrigen Diagramm-Einstellungen (lade_/speichere_
+        diagramm_einstellungen).
+        """
+        versuche = self.liste_versuche(projekt, methode)
+        if not versuche:
+            ctk.CTkLabel(parent, text="Keine lokalen Rohdaten gefunden.").pack(pady=20)
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+            import tkinter as tk
+        except ImportError:
+            ctk.CTkLabel(
+                parent,
+                text="matplotlib ist nicht installiert - 'pip install matplotlib' im GUI-Environment noetig.",
+                wraplength=560,
+            ).pack(pady=20)
+            return
+
+        zustand_standard = {"element_farben": {}, "element_sichtbar": {}, "mindestanteil": 0.0}
+        zustand = self.lade_diagramm_einstellungen(projekt, methode, zustand_standard)
+
+        haupt_layout = ctk.CTkFrame(parent, fg_color="transparent")
+        haupt_layout.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # --- Linke Spalte: Versuchsliste (analog Rohdaten-Tab) ---
+        linke_breite_merker = {"breite": 260}
+        linke_spalte = ctk.CTkFrame(haupt_layout, fg_color="transparent", width=linke_breite_merker["breite"])
+        linke_spalte.pack(side="left", fill="y", padx=(0, 0))
+        linke_spalte.pack_propagate(False)
+
+        kopfzeile = ctk.CTkFrame(linke_spalte, fg_color="transparent")
+        kopfzeile.pack(side="top", fill="x", padx=5, pady=(0, 5))
+        links_einklapp_btn = ctk.CTkButton(kopfzeile, text="◀", width=32, fg_color="transparent", border_width=1)
+        links_einklapp_btn.pack(side="left")
+
+        inhalt_links = ctk.CTkFrame(linke_spalte, fg_color="transparent")
+        inhalt_links.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(inhalt_links, text="Versuche", font=("Arial", 12, "bold")).pack(
+            side="top", anchor="w", padx=10, pady=(0, 5)
+        )
+        scroll = ctk.CTkScrollableFrame(inhalt_links, width=220)
+        scroll.pack(padx=0, pady=(0, 5), fill="both", expand=True)
+
+        griff_links = ctk.CTkFrame(haupt_layout, width=6, fg_color=("gray70", "gray25"), cursor="sb_h_double_arrow")
+        griff_links.pack(side="left", fill="y", padx=(4, 8))
+        self._mache_griff_ziehbar(griff_links, linke_spalte, linke_breite_merker, minimum=90, maximum=650, invertiert=False)
+        self._mache_spalte_einklappbar(
+            links_einklapp_btn, linke_spalte, inhalt_links, linke_breite_merker,
+            eingeklappt_text="◀", ausgeklappt_text="▶", breite_eingeklappt=48,
+        )
+
+        ausgewaehlter_pfad = {"wert": None}
+        zeilen_frames = []
+        aktualisiere_element_panel = {"fn": None}
+        aktualisiere_marker_panel = {"fn": None}
+        # Normierte Elementkarten (Prozent je Pixel) des GERADE angezeigten
+        # Versuchs - fuer den Maus-Hover-Readout (_bei_maus_bewegung) gecacht,
+        # damit beim reinen Bewegen der Maus NICHT jedes Mal alle TIFs neu
+        # von der Platte gelesen werden muessen.
+        aktuelle_daten = {"karten_normiert": None}
+        # "gezeichnet" merkt sich, ob im aktuellen Diagramm schon ein Bild
+        # steht (fuer den allerersten Zeichenaufruf eines Versuchs duerfen
+        # die noch auf (0,1) stehenden Default-Achsenlimits NICHT als "Zoom"
+        # missverstanden werden). Die eigentlichen Zoom-Grenzen werden
+        # IMMER frisch per ax.get_xlim()/get_ylim() aus dem Diagramm selbst
+        # gelesen (siehe zeichne()) statt aus einem separaten, potenziell
+        # veralteten Zwischenspeicher - dadurch bleibt der Zoom-Ausschnitt
+        # beim Umschalten von Element-Sichtbarkeit/Farbe/Filter-Schieberegler
+        # ("Alle an"/"Alle aus" etc.) zuverlaessig erhalten und "springt"
+        # nicht mehr auf die Vollansicht zurueck.
+        bild_status = {"gezeichnet": False}
+        # Markierungen ("Pins"), die der Nutzer im Bild gesetzt hat, um
+        # einzelne Stellen zu vergleichen (siehe _markierungs_klick /
+        # Markierungs-Liste im rechten Panel). Jede Markierung merkt sich
+        # Pixel-Koordinate + die Element-%-Werte an dieser Stelle.
+        markierungen = []
+        marker_modus = {"aktiv": False}
+
+        # --- Mitte: 1 grosses Overlay-Diagramm + Zoom-Werkzeugleiste +
+        # Filter-Schieberegler + Marker-Werkzeug + Pixel-Werte-Anzeige (Hover) ---
+        mitte = ctk.CTkFrame(haupt_layout, fg_color="transparent")
+        mitte.pack(side="left", fill="both", expand=True, padx=(0, 0))
+
+        # Untere Leiste (Hover-Readout + Filter/Marker-Zeile + Zoom-Toolbar)
+        # ZUERST mit side="bottom" packen, damit ihr Platz reserviert ist,
+        # bevor das (expandierende) Diagramm gepackt wird. Packreihenfolge
+        # von unten nach oben: Hover-Zeile ganz unten, darueber die
+        # Filter/Marker-Zeile, darueber die Matplotlib-Toolbar, direkt
+        # unter dem Diagramm.
+        untere_leiste = ctk.CTkFrame(mitte, fg_color="transparent")
+        untere_leiste.pack(side="bottom", fill="x")
+
+        # --- Hover-Readout: Pixel-Koordinate + je Element ein Farbkaestchen
+        # (identisch zur Overlay-Farbe) + Prozentwert, statt nur Fliesstext -
+        # so sieht man auf einen Blick, welche Farbe im Bild zu welchem
+        # Element/Wert gehoert.
+        #
+        # WICHTIG: die Zeile darf bei JEDER Mausbewegung neu befuellt werden
+        # (das passiert sehr oft) - wuerden die Widgets dabei jedes Mal
+        # zerstoert und neu erzeugt, aendert sich kurzzeitig ihre Breite und
+        # das ganze Diagramm "hüpft"/flackert. Daher: feste Hoehe fuer den
+        # Rahmen + ein fester Pool an wiederverwendeten "Slot"-Widgets, die
+        # nur per .configure() aktualisiert (nicht neu gebaut) werden. ---
+        hover_frame = ctk.CTkFrame(untere_leiste, fg_color=("gray92", "gray17"), height=34)
+        hover_frame.pack(side="bottom", fill="x", padx=8, pady=(4, 6))
+        hover_frame.pack_propagate(False)
+
+        hover_koord_label = ctk.CTkLabel(
+            hover_frame, text="Pixel-Werte: Maus über das Bild bewegen",
+            anchor="w", font=("Arial", 11, "bold"), width=230,
+        )
+        hover_koord_label.pack(side="left", padx=(8, 10), pady=5)
+
+        _HOVER_SLOT_ANZAHL = 12  # reicht fuer alle ueblichen SEM-Elementlisten
+        hover_slots = []
+        for _ in range(_HOVER_SLOT_ANZAHL):
+            slot = ctk.CTkFrame(hover_frame, fg_color="transparent")
+            swatch = ctk.CTkLabel(slot, text="", width=12, height=12, fg_color="#ffffff", corner_radius=3)
+            swatch.pack(side="left", padx=(0, 4))
+            text = ctk.CTkLabel(slot, text="", font=("Arial", 11), width=68, anchor="w")
+            text.pack(side="left")
+            hover_slots.append({"frame": slot, "swatch": swatch, "text": text, "sichtbar": False})
+
+        def _hover_zuruecksetzen():
+            hover_koord_label.configure(text="Pixel-Werte: Maus über das Bild bewegen")
+            for slot in hover_slots:
+                if slot["sichtbar"]:
+                    slot["frame"].pack_forget()
+                    slot["sichtbar"] = False
+
+        def _hover_anzeigen(x, y, werte_mit_farbe):
+            hover_koord_label.configure(text=f"Pixel ({x}, {y}):")
+            anzahl = min(len(werte_mit_farbe), _HOVER_SLOT_ANZAHL)
+            for index, slot in enumerate(hover_slots):
+                if index < anzahl:
+                    element, wert, farbe = werte_mit_farbe[index]
+                    slot["swatch"].configure(fg_color=farbe)
+                    slot["text"].configure(text=f"{element}: {wert:.1f}%")
+                    if not slot["sichtbar"]:
+                        slot["frame"].pack(side="left", padx=(0, 12), pady=5)
+                        slot["sichtbar"] = True
+                elif slot["sichtbar"]:
+                    slot["frame"].pack_forget()
+                    slot["sichtbar"] = False
+            if anzahl == 0:
+                hover_koord_label.configure(text=f"Pixel ({x}, {y}):  alle Elemente ~0 %")
+
+        _hover_zuruecksetzen()
+
+
+        # --- Filter-Zeile: Mindestanteil-Schwelle (nur Pixel anzeigen, an
+        # denen ein Element mindestens X % der lokalen Zusammensetzung
+        # ausmacht) + Marker-Werkzeug an/aus. ---
+        filter_zeile = ctk.CTkFrame(untere_leiste, fg_color="transparent")
+        filter_zeile.pack(side="bottom", fill="x", padx=8, pady=(2, 0))
+
+        ctk.CTkLabel(filter_zeile, text="Mindestanteil-Filter:", font=("Arial", 11)).pack(side="left", padx=(0, 6))
+        mindestanteil_wert_label = ctk.CTkLabel(filter_zeile, text="0 %", font=("Arial", 11), width=42)
+
+        def _mindestanteil_geaendert(neuer_wert):
+            zustand["mindestanteil"] = round(float(neuer_wert), 1)
+            mindestanteil_wert_label.configure(text=f"{zustand['mindestanteil']:.0f} %")
+            self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+            zeichne()
+
+        mindestanteil_slider = ctk.CTkSlider(
+            filter_zeile, from_=0, to=90, number_of_steps=90, width=180, command=_mindestanteil_geaendert,
+        )
+        mindestanteil_slider.set(float(zustand.get("mindestanteil", 0.0) or 0.0))
+        mindestanteil_slider.pack(side="left", padx=(0, 6))
+        mindestanteil_wert_label.configure(text=f"{float(zustand.get('mindestanteil', 0.0) or 0.0):.0f} %")
+        mindestanteil_wert_label.pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(
+            filter_zeile,
+            text="→ blendet Pixel aus, an denen ein Element weniger als diesen Anteil hat",
+            font=("Arial", 10), text_color=("gray30", "gray70"),
+        ).pack(side="left", padx=(0, 16))
+
+        marker_button = ctk.CTkButton(filter_zeile, text="📍 Marker setzen", width=140, fg_color="transparent", border_width=1)
+
+        def _marker_modus_umschalten():
+            marker_modus["aktiv"] = not marker_modus["aktiv"]
+            marker_button.configure(fg_color=MUL_TURKIS if marker_modus["aktiv"] else "transparent")
+
+        marker_button.configure(command=_marker_modus_umschalten)
+        marker_button.pack(side="right")
+
+        # NavigationToolbar2Tk braucht ein "echtes" Tk-Widget als Master -
+        # daher ein normales tk.Frame statt CTkFrame fuer den Toolbar-Container.
+        toolbar_frame = tk.Frame(untere_leiste)
+        toolbar_frame.pack(side="bottom", fill="x")
+
+        figsize = self._dynamische_figsize(mitte, 1, 1, mindest_breite_px=500, mindest_hoehe_px=420)
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        canvas = FigureCanvasTkAgg(fig, master=mitte)
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+
+        def _werte_am_pixel(x, y):
+            karten = aktuelle_daten["karten_normiert"]
+            if not karten:
+                return None
+            beispiel_karte = next(iter(karten.values()))
+            if not (0 <= y < beispiel_karte.shape[0] and 0 <= x < beispiel_karte.shape[1]):
+                return None
+            werte = sorted(
+                ((element, float(karte[y, x])) for element, karte in karten.items()),
+                key=lambda kv: -kv[1],
+            )
+            return [
+                (element, wert, zustand.get("element_farben", {}).get(element, "#ffffff"))
+                for element, wert in werte if wert >= 0.05
+            ]
+
+        def _bei_maus_bewegung(event):
+            if event.inaxes != ax or event.xdata is None or event.ydata is None:
+                return
+            x = int(round(event.xdata))
+            y = int(round(event.ydata))
+            werte = _werte_am_pixel(x, y)
+            if werte is None:
+                return
+            _hover_anzeigen(x, y, werte)
+
+        def _bei_maus_verlassen(_event):
+            _hover_zuruecksetzen()
+
+        def _bei_klick(event):
+            if not marker_modus["aktiv"] or event.inaxes != ax:
+                return
+            if event.xdata is None or event.ydata is None:
+                return
+            # Waehrend die Toolbar-Lupe/Pan aktiv ist, gehoert ein Klick zum
+            # Zoomen/Verschieben - dann KEINEN Marker setzen (sonst laesst
+            # sich nicht mehr sauber zoomen, waehrend Marker-Modus an ist).
+            if getattr(toolbar, "mode", ""):
+                return
+            x = int(round(event.xdata))
+            y = int(round(event.ydata))
+            werte = _werte_am_pixel(x, y)
+            if werte is None:
+                return
+            markierungen.append({
+                "x": x, "y": y,
+                "werte": {element: wert for element, wert, _farbe in werte},
+            })
+            if aktualisiere_marker_panel["fn"]:
+                aktualisiere_marker_panel["fn"]()
+            zeichne()
+
+        canvas.mpl_connect("motion_notify_event", _bei_maus_bewegung)
+        canvas.mpl_connect("axes_leave_event", _bei_maus_verlassen)
+        canvas.mpl_connect("button_press_event", _bei_klick)
+
+        def zeichne(zoom_beibehalten=True):
+            pfad = ausgewaehlter_pfad["wert"]
+            # Zoom-Ausschnitt IMMER frisch direkt vom Diagramm lesen (nicht
+            # aus einem separaten Zwischenspeicher) - das ist die einzige
+            # Quelle, die garantiert nicht veraltet sein kann. Nur beim
+            # allerersten Zeichnen eines Versuchs (bild_status["gezeichnet"]
+            # noch False) stehen hier die Matplotlib-Default-Limits (0,1),
+            # die duerfen NICHT als Zoom uebernommen werden.
+            kann_zoom_erhalten = zoom_beibehalten and bild_status["gezeichnet"]
+            vorherige_xlim = ax.get_xlim() if kann_zoom_erhalten else None
+            vorherige_ylim = ax.get_ylim() if kann_zoom_erhalten else None
+            ax.clear()
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if not pfad:
+                aktuelle_daten["karten_normiert"] = None
+                bild_status["gezeichnet"] = False
+                canvas.draw()
+                return
+            elementkarten, _eds_pfad = self._sem_lade_elementkarten(pfad)
+            if not elementkarten:
+                aktuelle_daten["karten_normiert"] = None
+                bild_status["gezeichnet"] = False
+                ax.text(0.5, 0.5, "Keine Elementkarten (TIF) gefunden", ha="center", va="center")
+                canvas.draw()
+                return
+            self._sem_stelle_element_zustand_sicher(zustand, elementkarten.keys())
+            # Fuer den Hover-Readout IMMER die auf Prozent normierten Karten
+            # nutzen (unabhaengig von der Overlay-Visualisierung unten), da
+            # das die tatsaechliche Element-% ist, die man ablesen will (z.B.
+            # "wie viel % Zink befindet sich an dieser Stelle").
+            karten_prozent = self._sem_normalisiere_elementkarten(elementkarten)
+            aktuelle_daten["karten_normiert"] = karten_prozent
+            overlay = self._sem_baue_overlay_bild(elementkarten, zustand, karten_prozent=karten_prozent)
+            ax.imshow(overlay)
+            ax.set_title(os.path.splitext(os.path.basename(pfad))[0])
+
+            # --- Markierungen ("Pins") als kleine nummerierte Kreise
+            # einzeichnen, damit man sie im Bild wiederfindet. ---
+            for index, marker in enumerate(markierungen, start=1):
+                ax.plot(marker["x"], marker["y"], marker="o", markersize=9,
+                        markerfacecolor="none", markeredgecolor="white", markeredgewidth=2)
+                ax.annotate(
+                    str(index), (marker["x"], marker["y"]), color="white", fontsize=9, fontweight="bold",
+                    ha="center", va="center",
+                )
+
+            if vorherige_xlim is not None and vorherige_ylim is not None:
+                ax.set_xlim(vorherige_xlim)
+                ax.set_ylim(vorherige_ylim)
+            bild_status["gezeichnet"] = True
+            fig.tight_layout()
+            canvas.draw()
+
+        def waehle_versuch(voller_pfad):
+            ausgewaehlter_pfad["wert"] = voller_pfad
+            for zeile, pfad in zeilen_frames:
+                zeile.configure(fg_color=MUL_TURKIS if pfad == voller_pfad else "transparent")
+            # Neuer Versuch -> alter Zoom-Ausschnitt UND alte Markierungen
+            # machen keinen Sinn mehr (anderes Bild) - beides zuruecksetzen.
+            bild_status["gezeichnet"] = False
+            markierungen.clear()
+            if aktualisiere_marker_panel["fn"]:
+                aktualisiere_marker_panel["fn"]()
+            if aktualisiere_element_panel["fn"]:
+                aktualisiere_element_panel["fn"]()
+            zeichne(zoom_beibehalten=False)
+
+        for _staub, eintrag, voller_pfad in versuche:
+            zeile = ctk.CTkFrame(scroll, fg_color="transparent")
+            zeile.pack(fill="x", pady=2)
+            label = ctk.CTkLabel(zeile, text=os.path.splitext(eintrag)[0], anchor="w")
+            label.pack(side="left", padx=5, fill="x", expand=True)
+            zeilen_frames.append((zeile, voller_pfad))
+            for widget in (zeile, label):
+                widget.bind("<Button-1>", lambda _e, p=voller_pfad: waehle_versuch(p))
+
+        # --- Rechts: Element-Liste ("durchklicken") mit Sichtbar-Checkbox +
+        # Farbauswahl je Element ---
+        rechte_breite_merker = {"breite": 260}
+        griff_rechts = ctk.CTkFrame(haupt_layout, width=6, fg_color=("gray70", "gray25"), cursor="sb_h_double_arrow")
+        griff_rechts.pack(side="left", fill="y", padx=(8, 4))
+
+        rechte_container = ctk.CTkFrame(haupt_layout, fg_color="transparent", width=rechte_breite_merker["breite"])
+        rechte_container.pack(side="left", fill="y")
+        rechte_container.pack_propagate(False)
+
+        rechte_kopfzeile = ctk.CTkFrame(rechte_container, fg_color="transparent")
+        rechte_kopfzeile.pack(side="top", fill="x", padx=(5, 0), pady=(0, 5))
+        rechts_einklapp_btn = ctk.CTkButton(
+            rechte_kopfzeile, text="▶", width=32, fg_color="transparent", border_width=1
+        )
+        rechts_einklapp_btn.pack(side="left")
+
+        rechte_spalte = ctk.CTkScrollableFrame(rechte_container, fg_color="transparent")
+        rechte_spalte.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(
+            rechte_spalte, text="Elemente", font=("Arial", 14, "bold")
+        ).pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(
+            rechte_spalte,
+            text="Häkchen = im Overlay sichtbar. Klick auf den Farbkreis öffnet die Farbauswahl.",
+            font=("Arial", 10), text_color=("gray30", "gray70"),
+            anchor="w", justify="left", wraplength=220,
+        ).pack(fill="x", padx=10, pady=(0, 10))
+
+        self._mache_griff_ziehbar(
+            griff_rechts, rechte_container, rechte_breite_merker, minimum=180, maximum=500, invertiert=True
+        )
+        self._mache_spalte_einklappbar(
+            rechts_einklapp_btn, rechte_container, rechte_spalte, rechte_breite_merker,
+            eingeklappt_text="▶", ausgeklappt_text="◀", breite_eingeklappt=48,
+        )
+
+        alle_button_zeile = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+        alle_button_zeile.pack(fill="x", padx=10, pady=(0, 8))
+
+        def _alle_setzen(sichtbar):
+            for element in zustand.get("element_farben", {}).keys():
+                zustand["element_sichtbar"][element] = sichtbar
+            self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+            _baue_element_zeilen()
+            zeichne()
+
+        ctk.CTkButton(
+            alle_button_zeile, text="Alle an", fg_color=MUL_TURKIS,
+            command=lambda: _alle_setzen(True),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ctk.CTkButton(
+            alle_button_zeile, text="Alle aus", fg_color="transparent",
+            border_width=1, border_color=MUL_TURKIS,
+            command=lambda: _alle_setzen(False),
+        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        element_liste_frame = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+        element_liste_frame.pack(fill="x", padx=0, pady=(0, 5))
+
+        def _baue_element_zeilen():
+            for kind in element_liste_frame.winfo_children():
+                kind.destroy()
+
+            elemente = sorted(zustand.get("element_farben", {}).keys())
+            if not elemente:
+                ctk.CTkLabel(
+                    element_liste_frame, text="Versuch auswählen, um Elemente zu laden.",
+                    text_color=("gray40", "gray60"), wraplength=220,
+                ).pack(padx=10, pady=10)
+                return
+
+            for element in elemente:
+                zeile = ctk.CTkFrame(element_liste_frame, fg_color=("gray90", "gray20"))
+                zeile.pack(fill="x", padx=10, pady=3)
+
+                sichtbar_var = ctk.BooleanVar(value=zustand["element_sichtbar"].get(element, True))
+
+                def _sichtbar_geaendert(element=element, var=sichtbar_var):
+                    zustand["element_sichtbar"][element] = bool(var.get())
+                    self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+                    zeichne()
+
+                ctk.CTkCheckBox(
+                    zeile, text=element, variable=sichtbar_var, command=_sichtbar_geaendert,
+                ).pack(side="left", padx=(8, 4), pady=6, fill="x", expand=True)
+
+                aktuelle_farbe = zustand["element_farben"].get(element, "#ffffff")
+                farb_button = ctk.CTkButton(
+                    zeile, text="", width=28, height=20, fg_color=aktuelle_farbe,
+                    hover_color=aktuelle_farbe, border_width=1, border_color=("gray50", "gray50"),
+                )
+
+                def _farbe_waehlen(element=element, button=farb_button):
+                    start_farbe = zustand["element_farben"].get(element, "#ffffff")
+                    ergebnis = colorchooser.askcolor(color=start_farbe, title=f"Farbe für {element}")
+                    neue_farbe_hex = ergebnis[1] if ergebnis else None
+                    if not neue_farbe_hex:
+                        return
+                    zustand["element_farben"][element] = neue_farbe_hex
+                    button.configure(fg_color=neue_farbe_hex, hover_color=neue_farbe_hex)
+                    self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+                    zeichne()
+
+                farb_button.configure(command=_farbe_waehlen)
+                farb_button.pack(side="right", padx=(4, 8), pady=6)
+
+        aktualisiere_element_panel["fn"] = _baue_element_zeilen
+
+        # --- Markierungen ("Pins") + Vergleichs-Liste: zeigt fuer jede per
+        # Klick gesetzte Markierung die Element-%-Werte an genau dieser
+        # Bildstelle; der jeweils HOECHSTE Wert je Element ist fett/gruen
+        # hervorgehoben, damit auf einen Blick erkennbar ist, an welcher
+        # Markierung von einem Element am meisten vorhanden ist. ---
+        ctk.CTkFrame(rechte_spalte, fg_color=("gray70", "gray30"), height=1).pack(fill="x", padx=10, pady=(10, 10))
+        ctk.CTkLabel(
+            rechte_spalte, text="Markierungen (Vergleich)", font=("Arial", 14, "bold")
+        ).pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(
+            rechte_spalte,
+            text="„📍 Marker setzen“ unten aktivieren, dann ins Bild klicken. Der höchste Wert je Element ist grün markiert.",
+            font=("Arial", 10), text_color=("gray30", "gray70"),
+            anchor="w", justify="left", wraplength=220,
+        ).pack(fill="x", padx=10, pady=(0, 8))
+
+        marker_liste_frame = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+        marker_liste_frame.pack(fill="x", padx=0, pady=(0, 5))
+
+        def _marker_entfernen(marker):
+            if marker in markierungen:
+                markierungen.remove(marker)
+            _baue_marker_liste()
+            zeichne()
+
+        def _marker_alle_loeschen():
+            markierungen.clear()
+            _baue_marker_liste()
+            zeichne()
+
+        def _baue_marker_liste():
+            for kind in marker_liste_frame.winfo_children():
+                kind.destroy()
+
+            if not markierungen:
+                ctk.CTkLabel(
+                    marker_liste_frame, text="Noch keine Markierungen gesetzt.",
+                    text_color=("gray40", "gray60"), wraplength=220,
+                ).pack(padx=10, pady=(0, 10))
+                return
+
+            # Hoechsten Wert je Element ueber ALLE Markierungen ermitteln,
+            # um ihn unten hervorzuheben (Kern der "Vergleich"-Funktion).
+            maxima = {}
+            for marker in markierungen:
+                for element, wert in marker["werte"].items():
+                    if wert >= 0.05 and wert > maxima.get(element, -1.0):
+                        maxima[element] = wert
+
+            for index, marker in enumerate(markierungen, start=1):
+                zeile = ctk.CTkFrame(marker_liste_frame, fg_color=("gray90", "gray20"))
+                zeile.pack(fill="x", padx=10, pady=3)
+
+                kopf = ctk.CTkFrame(zeile, fg_color="transparent")
+                kopf.pack(fill="x", padx=8, pady=(6, 2))
+                ctk.CTkLabel(
+                    kopf, text=f"M{index}  ·  Pixel ({marker['x']}, {marker['y']})",
+                    font=("Arial", 11, "bold"), anchor="w",
+                ).pack(side="left", fill="x", expand=True)
+                ctk.CTkButton(
+                    kopf, text="✕", width=22, height=20, fg_color="transparent",
+                    border_width=1, command=lambda m=marker: _marker_entfernen(m),
+                ).pack(side="right")
+
+                top_werte = sorted(marker["werte"].items(), key=lambda kv: -kv[1])[:6]
+                for element, wert in top_werte:
+                    if wert < 0.05:
+                        continue
+                    ist_maximum = len(markierungen) > 1 and abs(wert - maxima.get(element, -1.0)) < 1e-9
+                    ctk.CTkLabel(
+                        zeile,
+                        text=f"{element}: {wert:.1f}%" + ("  ▲ am meisten" if ist_maximum else ""),
+                        font=("Arial", 10, "bold" if ist_maximum else "normal"),
+                        text_color=("#0a7a2e", "#4ade80") if ist_maximum else None,
+                        anchor="w",
+                    ).pack(fill="x", padx=16, pady=1)
+                ctk.CTkFrame(zeile, fg_color="transparent", height=4).pack()
+
+            ctk.CTkButton(
+                marker_liste_frame, text="Alle Markierungen löschen", fg_color="transparent",
+                border_width=1, border_color=MUL_TURKIS, command=_marker_alle_loeschen,
+            ).pack(fill="x", padx=10, pady=(4, 10))
+
+        aktualisiere_marker_panel["fn"] = _baue_marker_liste
+        _baue_marker_liste()
+
+        # --- Ersten Versuch automatisch auswaehlen ---
+        waehle_versuch(versuche[0][2])
 
     # ------------------------------------------------------------------
     # TAB: ERGEBNISSE (TGA) - Relative Masse + Reaktionskinetik pro Versuch

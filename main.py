@@ -432,6 +432,16 @@ SEM_FARBSKALIERUNG_OPTIONEN = ("linear", "p99")
 SEM_FARBSKALIERUNG_LABELS = {"linear": "Linear", "p99": "p99"}
 SEM_FARBSKALIERUNG_LABEL_ZU_WERT = {v: k for k, v in SEM_FARBSKALIERUNG_LABELS.items()}
 
+# Rohwert-Obergrenze eines 16-Bit-Graustufenbilds (2^16 - 1) - Basis fuer die
+# %-Beschriftung der Farbskalen-Legende (siehe baue_ergebnisse_tab_sem):
+# ein Kartenwert wird als Prozent DIESES festen Maximums ausgedrueckt, nicht
+# als Prozent des jeweiligen Karten-eigenen Maximums. Dadurch reicht die
+# Legende nur bis zu dem Prozentwert, der tatsaechlich in der Karte
+# vorkommt (x_max/SEM_16BIT_MAXIMUM), statt immer kuenstlich bis 100 % zu
+# gehen - und Karten unterschiedlicher Elemente/Versuche bleiben ueber die
+# %-Achse vergleichbar.
+SEM_16BIT_MAXIMUM = 65535.0
+
 # Optional: anderer Python-Interpreter für die EMI-Berechnung (falls HSMTools
 # in einer eigenen venv installiert ist, nicht in der venv der GUI-App).
 # Kann alternativ auch als Umgebungsvariable HSMTOOLS_PYTHON gesetzt werden.
@@ -5716,13 +5726,17 @@ class LaborApp(ctk.CTk):
                 # die Rohdaten selbst aendern sich dadurch NICHT. ---
                 divider = make_axes_locatable(ax)
                 cax = divider.append_axes("right", size="4%", pad=0.12)
-                # Achse in % statt im rohen 16-Bit-Signalwert: 0 % = x_min
-                # (dunkelste Farbe), 100 % = x_max (hellste Farbe, haengt
-                # vom Linear/p99-Modus ab) - die zugrundeliegende Normierung
-                # des Bilds (siehe _sem_baue_element_farbbild) bleibt exakt
-                # gleich, nur die Beschriftung der Legende aendert sich.
+                # Achse in % des vollen 16-Bit-Wertebereichs (0 - 65535,
+                # siehe SEM_16BIT_MAXIMUM) statt im rohen Signalwert: die
+                # Legende reicht nur bis zu dem Prozentwert, der in der
+                # Karte tatsaechlich vorkommt (x_max), nicht kuenstlich bis
+                # 100 % - die zugrundeliegende Normierung des Bilds (siehe
+                # _sem_baue_element_farbbild) bleibt exakt gleich, nur die
+                # Beschriftung der Legende aendert sich.
+                prozent_min = x_min / SEM_16BIT_MAXIMUM * 100.0
+                prozent_max = x_max / SEM_16BIT_MAXIMUM * 100.0
                 mappable = mcm.ScalarMappable(
-                    norm=Normalize(vmin=0, vmax=100), cmap=SEM_FARBSKALA_COLORMAP
+                    norm=Normalize(vmin=prozent_min, vmax=prozent_max), cmap=SEM_FARBSKALA_COLORMAP
                 )
                 colorbar = fig.colorbar(mappable, cax=cax)
                 skalierungs_label = SEM_FARBSKALIERUNG_LABELS.get(
@@ -5802,6 +5816,20 @@ class LaborApp(ctk.CTk):
             bild_status["gezeichnet"] = True
             fig.tight_layout()
             canvas.draw()
+            if not kann_zoom_erhalten:
+                # Frischgezeichnetes Bild OHNE uebernommenen Zoom (neuer
+                # Versuch bzw. allererstes Zeichnen) = die tatsaechliche
+                # "Originalansicht". Der Toolbar-Startzustand (toolbar.update()
+                # direkt nach dem Erstellen) wurde dagegen VOR dem allerersten
+                # Bild gesetzt (leere 0-1-Achse) - der "Original view
+                # zuruecksetzen"-Knopf (Haus-Symbol) sprang deshalb auf diese
+                # leere Ansicht statt auf das echte Bild zurueck. Hier wird
+                # der Home-Zustand der Toolbar daher auf die gerade
+                # gezeichnete, unverzoomte Ansicht aktualisiert. NICHT
+                # aufrufen, wenn ein bestehender Zoom beibehalten wurde
+                # (kann_zoom_erhalten), sonst wuerde "Home" auf den Zoom
+                # statt auf die echte Originalansicht zurueckspringen.
+                toolbar.update()
 
         def waehle_versuch(voller_pfad):
             ausgewaehlter_pfad["wert"] = voller_pfad

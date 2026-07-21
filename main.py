@@ -99,7 +99,12 @@ class EDSFilterParser:
         return True, "✓ Filter ist gültig"
 
 # --- KONFIGURATION ---
-BASIS_PFAD = r"C:\Users\aaron\Nextcloud\Documents\work\H2Lab_Evaluation_System"
+BASIS_PFAD = os.environ.get("Dateipfad", "").strip()
+if not BASIS_PFAD:
+    raise RuntimeError(
+        "Die Umgebungsvariable 'Dateipfad' ist nicht gesetzt. "
+        "Bitte in der VS-Code-Umgebung einen Basispfad konfigurieren."
+    )
 MUL_TURKIS = "#008c96"
 MUL_DUNKEL = "#0a2a2d"
 

@@ -346,8 +346,8 @@ def tga_achsen_label_fuer_spalte(spalte):
 # siehe _sem_lade_elementkarten). Liste bei Bedarf um weitere im Labor
 # gemessene Elemente ergaenzen.
 SEM_FILTER_ELEMENTE = (
-    "C", "O", "Al", "Si", "Ca", "Fe", "Mg", "Mn", "Zn", "Na", "K",
-    "Cl", "S", "Ti", "Cr", "Cu", "Ni", "Pb", "P", "V", "F",
+    "Al", "C", "Ca", "Cl", "Cr", "Cu", "F", "Fe", "K", "Mg", "Mn",
+    "Na", "Ni", "O", "P", "Pb", "S", "Si", "Ti", "V", "Zn",
 )
 SEM_FILTER_OPERATOREN = ("<", "<=", ">", ">=")
 # Ein Default-Filter, analog zum in der Aufgabenstellung genannten Beispiel "C < 30".
@@ -401,7 +401,9 @@ class LaborApp(ctk.CTk):
         super().__init__()
         self.title("MUL - H2Lab Staub-System")
         self.geometry("600x800")
-        ctk.set_appearance_mode("System")
+        # Immer Dark Mode - unabhaengig vom System-Theme des Nutzers (nicht
+        # "System", da das bei hellem OS-Theme auf Light umschalten wuerde).
+        ctk.set_appearance_mode("Dark")
 
         # Bekanntes CustomTkinter-Problem: die interne DPI-Scaling-Prüfschleife
         # (check_dpi_scaling / update, per self.after() geplant) läuft weiter,

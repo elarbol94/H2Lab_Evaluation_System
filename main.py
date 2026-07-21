@@ -413,6 +413,25 @@ SEM_ELEMENT_FARBPALETTE = (
     "#dcbeff", "#9a6324", "#800000", "#aaffc3", "#000075",
 )
 
+# --- Element-Ansicht im Ergebnisse-Tab (siehe baue_ergebnisse_tab_sem):
+# statt eines Overlays aus mehreren einfarbigen Elementkarten wird GENAU
+# EINE Elementkarte gezeigt (per Dropdown auswaehlbar), eingefaerbt ueber
+# eine echte Farbskala (Colormap) auf Basis der rohen 16-Bit-Grauwerte des
+# TIFs (0 - 65535): niedrige Werte -> dunkle/kalte Farbe, hohe Werte ->
+# helle/warme Farbe. "viridis" ist dafuer gut geeignet (dunkles Violett bei
+# 0 bis helles Gelb bei 1) und zusaetzlich farbenblind-freundlich.
+SEM_FARBSKALA_COLORMAP = "viridis"
+
+# Modi fuer die Obergrenze der Farbnormierung (siehe
+# _sem_baue_element_farbbild). Aendert NUR die Darstellung, nicht die
+# Rohdaten/Pixelgeometrie:
+#   "linear" - Obergrenze = tatsaechliches Maximum der Karte.
+#   "p99"    - Obergrenze = 99. Perzentil der Karte (robuster gegen
+#              einzelne sehr helle Ausreisser, mehr Kontrast im Rest).
+SEM_FARBSKALIERUNG_OPTIONEN = ("linear", "p99")
+SEM_FARBSKALIERUNG_LABELS = {"linear": "Linear", "p99": "p99"}
+SEM_FARBSKALIERUNG_LABEL_ZU_WERT = {v: k for k, v in SEM_FARBSKALIERUNG_LABELS.items()}
+
 # Optional: anderer Python-Interpreter für die EMI-Berechnung (falls HSMTools
 # in einer eigenen venv installiert ist, nicht in der venv der GUI-App).
 # Kann alternativ auch als Umgebungsvariable HSMTOOLS_PYTHON gesetzt werden.
@@ -4206,6 +4225,7 @@ class LaborApp(ctk.CTk):
             return
 
         try:
+            import matplotlib as mpl
             import matplotlib.pyplot as plt
             import matplotlib.cm as cm
             import matplotlib.colors as mcolors
@@ -4322,7 +4342,7 @@ class LaborApp(ctk.CTk):
         canvas = FigureCanvasTkAgg(fig, master=plot_frame)
         canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
 
-        cmap = plt.get_cmap("jet")
+        cmap = mpl.colormaps["jet"]
         vmin_start, vmax_start = farbskala_grenzen()
         sm = cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=vmin_start, vmax=vmax_start))
         sm.set_array([])
@@ -5052,60 +5072,85 @@ class LaborApp(ctk.CTk):
             if element not in zustand["element_sichtbar"]:
                 zustand["element_sichtbar"][element] = True
 
-    def _sem_baue_overlay_bild(self, elementkarten, zustand, karten_prozent=None, pixel_maske=None):
+    def _sem_baue_element_farbbild(self, karte, element, zustand, karten_prozent=None, pixel_maske=None):
         """
-        Baut das farbige Overlay-Bild: jede sichtbare Elementkarte wird auf
-        [0, 1] skaliert (robust, per 99. Perzentil statt Maximum - schuetzt
-        vor Ausreissern) und mit ihrer zugewiesenen Farbe additiv in ein
-        RGB-Bild gemischt, danach auf [0, 1] geclippt.
+        Baut das farbige Bild fuer GENAU EINE Elementkarte mittels einer
+        echten Farbskala (Colormap), ausgehend von den rohen 16-Bit-
+        Grauwerten des TIFs (0 - 65535 je Pixel):
 
-        `karten_prozent` (optional): die auf Prozent normierten Elementkarten
-        (siehe _sem_normalisiere_elementkarten). Ist zustand["mindestanteil"]
-        > 0 gesetzt (Filter-Schieberegler im Ergebnisse-Tab), werden Pixel,
-        an denen ein Element WENIGER als dieser Prozentsatz zur lokalen
-        Zusammensetzung beitraegt, fuer genau dieses Element ausgeblendet -
-        so laesst sich z.B. "nur Bereiche mit >= 20% Kupfer" einblenden.
+          1. Pixelwert aus dem TIF (unveraendert, `karte`).
+          2. Normierung auf [0, 1]: n(x) = clip((x - x_min) / (x_max - x_min), 0, 1)
+             mit x_min = tatsaechliches Minimum der Karte (i.d.R. 0) und
+             x_max abhaengig vom Skalierungs-Modus (siehe unten).
+          3. Zuordnung des normierten Werts zu SEM_FARBSKALA_COLORMAP:
+             niedrige Werte -> dunkle/kalte Farbe, hohe Werte -> helle/
+             warme Farbe.
 
-        `pixel_maske` (optional): boolesche Maske (aus den Rohdaten-Tab-
-        Filtern, siehe _sem_wende_filter_an) - ist sie gesetzt, werden NUR
-        die gefilterten Pixel angezeigt; alle anderen erscheinen weiss
-        (statt schwarz), analog zum Rohdaten-Tab.
+        Modus `zustand["farbskalierung"]` (siehe SEM_FARBSKALIERUNG_OPTIONEN)
+        bestimmt NUR die Obergrenze x_max der Normierung - die Rohdaten und
+        die Pixelgeometrie bleiben in beiden Faellen unveraendert:
+          "linear" - x_max = tatsaechliches Maximum der Karte. Einzelne sehr
+                     helle Ausreisser koennen dadurch den Grossteil der
+                     Farbskala beanspruchen, der Rest wirkt vergleichsweise
+                     dunkel/kontrastarm.
+          "p99"    - x_max = 99. Perzentil der Karte. Die obersten ~1% der
+                     Pixelwerte werden auf die Endfarbe gekappt, der
+                     restliche (relevante) Wertebereich wird staerker ueber
+                     die Farbskala verteilt -> schwaechere raeumliche
+                     Strukturen werden deutlicher sichtbar.
+
+        `karten_prozent`/`mindestanteil` (optional, wie zuvor): Pixel, an
+        denen dieses Element WENIGER als den eingestellten Prozentsatz zur
+        lokalen Zusammensetzung beitraegt, werden auf die dunkelste
+        Farbskalenfarbe gesetzt (== "kein/kaum Signal hier").
+
+        `pixel_maske` (optional): boolesche Maske (Rohdaten-Tab-Filter) -
+        ist sie gesetzt, werden NUR die gefilterten Pixel eingefaerbt; alle
+        anderen erscheinen weiss, analog zum Rohdaten-Tab.
+
+        Gibt (rgb_bild, x_min, x_max) zurueck; x_min/x_max werden fuer die
+        Farbskalen-Legende (Colorbar) im Diagramm gebraucht. Bei leerer/
+        konstanter Karte: (None, 0.0, 0.0).
         """
         import numpy as np
+        import matplotlib as mpl
 
-        if not elementkarten:
-            return None
-        form = next(iter(elementkarten.values())).shape
-        rgb = np.zeros((*form, 3), dtype=np.float64)
-        irgendeins_sichtbar = False
+        if karte is None or karte.size == 0:
+            return None, 0.0, 0.0
+
+        x_min = float(np.min(karte))
+        if zustand.get("farbskalierung", "p99") == "linear":
+            x_max = float(np.max(karte))
+        else:
+            x_max = float(np.percentile(karte, 99))
+        if x_max <= x_min:
+            x_max = x_min + 1.0
+
+        normiert = np.clip((karte - x_min) / (x_max - x_min), 0.0, 1.0)
+
         mindestanteil = float(zustand.get("mindestanteil", 0.0) or 0.0)
-        for element, karte in elementkarten.items():
-            if not zustand.get("element_sichtbar", {}).get(element, True):
-                continue
-            irgendeins_sichtbar = True
-            skala = float(np.percentile(karte, 99)) or 1.0
-            karte_norm = np.clip(karte / skala, 0.0, 1.0)
-            if mindestanteil > 0.0 and karten_prozent is not None and element in karten_prozent:
-                karte_norm = np.where(karten_prozent[element] >= mindestanteil, karte_norm, 0.0)
-            farbe = self._sem_farbe_hex_zu_rgb(zustand.get("element_farben", {}).get(element, "#ffffff"))
-            for kanal in range(3):
-                rgb[..., kanal] += karte_norm * farbe[kanal]
-        ergebnis = rgb if irgendeins_sichtbar else np.zeros((*form, 3), dtype=np.float64)
-        ergebnis = np.clip(ergebnis, 0.0, 1.0)
-        if pixel_maske is not None and pixel_maske.shape == form:
-            ergebnis[~pixel_maske] = 1.0
-        return ergebnis
+        if mindestanteil > 0.0 and karten_prozent is not None and element in karten_prozent:
+            normiert = np.where(karten_prozent[element] >= mindestanteil, normiert, 0.0)
+
+        colormap = mpl.colormaps[SEM_FARBSKALA_COLORMAP]
+        rgb_bild = np.asarray(colormap(normiert))[..., :3].copy()
+
+        if pixel_maske is not None and pixel_maske.shape == karte.shape:
+            rgb_bild[~pixel_maske] = 1.0
+
+        return rgb_bild, x_min, x_max
 
     def baue_ergebnisse_tab_sem(self, parent, projekt, methode):
         """
         SEM-Gegenstueck zu baue_ergebnisse_tab (EMI)/baue_ergebnisse_tab_tga:
-        links Versuchsauswahl, in der Mitte ein grosses Overlay-Diagramm
-        (alle aktivierten Elementkarten uebereinander, je eigene Farbe),
-        rechts die Element-Liste zum "Durchklicken" - pro Element eine
-        Sichtbar-Checkbox + Farbauswahl-Button (oeffnet den System-
-        Farbwaehler, siehe tkinter.colorchooser). Die Element->Farbe/
-        Sichtbar-Zuordnung ist projektweit (nicht pro Versuch) gespeichert,
-        wie die uebrigen Diagramm-Einstellungen (lade_/speichere_
+        links Versuchsauswahl, in der Mitte GENAU EINE Elementkarte
+        (per Dropdown rechts auswaehlbar), eingefaerbt ueber eine echte
+        Farbskala/Colormap samt Legende (Colorbar) - siehe
+        _sem_baue_element_farbbild. Rechts: Dropdown zur Elementauswahl
+        sowie ein Linear/p99-Umschalter fuer die Obergrenze der
+        Farbnormierung (siehe SEM_FARBSKALIERUNG_OPTIONEN). Auswahl/
+        Skalierung sind projektweit (nicht pro Versuch) gespeichert, wie
+        die uebrigen Diagramm-Einstellungen (lade_/speichere_
         diagramm_einstellungen).
         """
         versuche = self.liste_versuche(projekt, methode)
@@ -5116,6 +5161,10 @@ class LaborApp(ctk.CTk):
         try:
             import matplotlib.pyplot as plt
             import matplotlib.patches as mpatches
+            import matplotlib.cm as mcm
+            from matplotlib.colors import Normalize
+            from matplotlib.ticker import PercentFormatter
+            from mpl_toolkits.axes_grid1 import make_axes_locatable
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
             import tkinter as tk
             import numpy as np
@@ -5127,12 +5176,17 @@ class LaborApp(ctk.CTk):
             ).pack(pady=20)
             return
 
-        zustand_standard = {"element_farben": {}, "element_sichtbar": {}, "mindestanteil": 0.0}
+        zustand_standard = {
+            "element_farben": {}, "element_sichtbar": {}, "mindestanteil": 0.0,
+            "ausgewaehltes_element": None, "farbskalierung": "p99",
+        }
         zustand = self.lade_diagramm_einstellungen(projekt, methode, zustand_standard)
         # Absichern gegen kaputte/veraltete gespeicherte Werte (z.B. "transparent"
         # oder leere Strings) - siehe _sem_sichere_hex_farbe.
         for _element, _farbe in list(zustand.get("element_farben", {}).items()):
             zustand["element_farben"][_element] = self._sem_sichere_hex_farbe(_farbe)
+        if zustand.get("farbskalierung") not in SEM_FARBSKALIERUNG_OPTIONEN:
+            zustand["farbskalierung"] = "p99"
 
         haupt_layout = ctk.CTkFrame(parent, fg_color="transparent")
         haupt_layout.pack(fill="both", expand=True, padx=10, pady=10)
@@ -5299,6 +5353,11 @@ class LaborApp(ctk.CTk):
         fig, ax = plt.subplots(1, 1, figsize=figsize)
         canvas = FigureCanvasTkAgg(fig, master=mitte)
         canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+        # Merkt sich die Colorbar-Achse der Farbskalen-Legende zwischen
+        # zwei zeichne()-Aufrufen, damit sie vor jedem Neuzeichnen sauber
+        # entfernt wird (statt sich bei jedem Aufruf zu verdoppeln).
+        farbskala_status = {"cax": None}
 
         toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
         toolbar.update()
@@ -5613,16 +5672,67 @@ class LaborApp(ctk.CTk):
             if pixel_maske is not None:
                 pixel_maske = pixel_maske & probe_maske
 
-            overlay = self._sem_baue_overlay_bild(
-                elementkarten, zustand, karten_prozent=karten_prozent, pixel_maske=pixel_maske,
+            # --- Element-Auswahl: per Dropdown im rechten Panel gewaehlt
+            # (zustand["ausgewaehltes_element"]). Ist noch keins gewaehlt
+            # oder das gespeicherte Element gibt es im aktuellen Versuch
+            # nicht (z.B. Versuchswechsel), faellt automatisch das
+            # haeufigste Element (hoechster mittlerer %-Anteil) als
+            # Default heran. ---
+            aktives_element = zustand.get("ausgewaehltes_element")
+            if aktives_element not in elementkarten:
+                if karten_prozent:
+                    aktives_element = max(
+                        karten_prozent.keys(), key=lambda e: float(np.nanmean(karten_prozent[e]))
+                    )
+                else:
+                    aktives_element = next(iter(elementkarten.keys()))
+                zustand["ausgewaehltes_element"] = aktives_element
+
+            # Vorherige Colorbar-Achse entfernen, bevor eine neue gezeichnet
+            # wird - sonst haeufen sich bei jedem zeichne()-Aufruf weitere
+            # Colorbars an.
+            if farbskala_status["cax"] is not None:
+                try:
+                    farbskala_status["cax"].remove()
+                except Exception:
+                    pass
+                farbskala_status["cax"] = None
+
+            bild, x_min, x_max = self._sem_baue_element_farbbild(
+                elementkarten[aktives_element], aktives_element, zustand,
+                karten_prozent=karten_prozent, pixel_maske=pixel_maske,
             )
             ax.set_facecolor("white")
-            ax.imshow(
-                overlay,
-                extent=(-0.5, anzeige_w - 0.5, anzeige_h - 0.5, -0.5),
-                interpolation="nearest",
-            )
-            ax.set_title(os.path.splitext(os.path.basename(pfad))[0])
+            if bild is not None:
+                ax.imshow(
+                    bild,
+                    extent=(-0.5, anzeige_w - 0.5, anzeige_h - 0.5, -0.5),
+                    interpolation="nearest",
+                )
+                # --- Farbskalen-Legende (Colorbar): zeigt, welcher
+                # 16-Bit-Grauwert (Signalintensitaet des gewaehlten
+                # Elements) welcher Farbe entspricht. x_max haengt vom
+                # Linear/p99-Modus ab (siehe _sem_baue_element_farbbild) -
+                # die Rohdaten selbst aendern sich dadurch NICHT. ---
+                divider = make_axes_locatable(ax)
+                cax = divider.append_axes("right", size="4%", pad=0.12)
+                # Achse in % statt im rohen 16-Bit-Signalwert: 0 % = x_min
+                # (dunkelste Farbe), 100 % = x_max (hellste Farbe, haengt
+                # vom Linear/p99-Modus ab) - die zugrundeliegende Normierung
+                # des Bilds (siehe _sem_baue_element_farbbild) bleibt exakt
+                # gleich, nur die Beschriftung der Legende aendert sich.
+                mappable = mcm.ScalarMappable(
+                    norm=Normalize(vmin=0, vmax=100), cmap=SEM_FARBSKALA_COLORMAP
+                )
+                colorbar = fig.colorbar(mappable, cax=cax)
+                skalierungs_label = SEM_FARBSKALIERUNG_LABELS.get(
+                    zustand.get("farbskalierung", "p99"), "p99"
+                )
+                colorbar.set_label(f"Signalintensität in % vom Maximum – {skalierungs_label}", fontsize=9)
+                colorbar.ax.yaxis.set_major_formatter(PercentFormatter())
+                colorbar.ax.tick_params(labelsize=8)
+                farbskala_status["cax"] = cax
+            ax.set_title(f"{os.path.splitext(os.path.basename(pfad))[0]}  –  Element: {aktives_element}")
 
             # --- Markierungen: kleiner nummerierter Kreis am Pixel (einzelner
             # Klick) ODER gestricheltes Rechteck (Rechteck-Auswahl per
@@ -5739,15 +5849,16 @@ class LaborApp(ctk.CTk):
         rechte_spalte.pack(fill="both", expand=True)
 
         ctk.CTkLabel(
-            rechte_spalte, text="Elemente", font=("Arial", 14, "bold")
+            rechte_spalte, text="Element", font=("Arial", 14, "bold")
         ).pack(fill="x", padx=10, pady=(0, 5))
         ctk.CTkLabel(
             rechte_spalte,
             text=(
-                "Häkchen = im Overlay sichtbar. Klick auf den Farbkreis öffnet "
-                "die Farbauswahl. Strg + Mausrad = Diagramm zoomen. Lupe in der "
-                "Toolbar: mit linker Maustaste ein Rechteck aufziehen = reinzoomen, "
-                "mit rechter Maustaste aufziehen = wieder rauszoomen."
+                "Element unten im Dropdown wählen - die Karte wird über eine "
+                "Farbskala (Colormap) eingefärbt: dunkel/kalt = niedrige, "
+                "hell/warm = hohe Signalintensität. Strg + Mausrad = Diagramm "
+                "zoomen. Lupe in der Toolbar: mit linker Maustaste ein Rechteck "
+                "aufziehen = reinzoomen, mit rechter Maustaste = rauszoomen."
             ),
             font=("Arial", 10), text_color=("gray30", "gray70"),
             anchor="w", justify="left", wraplength=220,
@@ -5761,35 +5872,19 @@ class LaborApp(ctk.CTk):
             eingeklappt_text="▶", ausgeklappt_text="◀", breite_eingeklappt=48,
         )
 
-        alle_button_zeile = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
-        alle_button_zeile.pack(fill="x", padx=10, pady=(0, 8))
-
-        def _alle_setzen(sichtbar):
-            for element in zustand.get("element_farben", {}).keys():
-                zustand["element_sichtbar"][element] = sichtbar
-            self.speichere_diagramm_einstellungen(projekt, methode, zustand)
-            _baue_element_zeilen()
-            zeichne()
-
-        ctk.CTkButton(
-            alle_button_zeile, text="Alle an", fg_color=MUL_TURKIS,
-            command=lambda: _alle_setzen(True),
-        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
-        ctk.CTkButton(
-            alle_button_zeile, text="Alle aus", fg_color="transparent",
-            border_width=1, border_color=MUL_TURKIS,
-            command=lambda: _alle_setzen(False),
-        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
-
         # --- Sortier-Umschalter: "Häufigkeit" (Standard, absteigend nach
-        # mittlerem Flächenanteil %) oder "Alphabetisch". Wird projektweit
-        # mitgespeichert (wie element_farben/element_sichtbar). ---
+        # mittlerem Flächenanteil %) oder "Alphabetisch". Bestimmt die
+        # Reihenfolge der Elemente im Dropdown direkt darunter. Wird
+        # projektweit mitgespeichert (wie ausgewaehltes_element/
+        # farbskalierung). Bewusst UEBER dem Dropdown platziert, damit
+        # sofort klar ist, dass sich die Einstellung auf dessen
+        # Element-Reihenfolge bezieht. ---
         SEM_SORTIER_OPTIONEN = ("haeufigkeit", "alphabetisch")
         if zustand.get("element_sortierung") not in SEM_SORTIER_OPTIONEN:
             zustand["element_sortierung"] = "haeufigkeit"
 
         sortier_zeile = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
-        sortier_zeile.pack(fill="x", padx=10, pady=(0, 8))
+        sortier_zeile.pack(fill="x", padx=10, pady=(0, 6))
         ctk.CTkLabel(sortier_zeile, text="Sortieren nach:", font=("Arial", 11)).pack(side="left", padx=(0, 6))
 
         sortier_button = ctk.CTkButton(sortier_zeile, text="", width=140, fg_color="transparent", border_width=1)
@@ -5808,8 +5903,63 @@ class LaborApp(ctk.CTk):
         sortier_button.configure(text=_sortier_label(), command=_sortierung_umschalten)
         sortier_button.pack(side="left")
 
-        element_liste_frame = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
-        element_liste_frame.pack(fill="x", padx=0, pady=(0, 5))
+        # --- Element-Dropdown: waehlt GENAU EIN Element aus, dessen Karte
+        # in der Mitte als Farbskalen-Bild gezeichnet wird (siehe zeichne()/
+        # _sem_baue_element_farbbild). Ersetzt die frueheren Mehrfachauswahl-
+        # Haekchen samt freier Farbwahl, da nur noch ein Element gleichzeitig
+        # ueber die Colormap dargestellt wird. ---
+        element_dropdown = ctk.CTkOptionMenu(
+            rechte_spalte, values=["–"], fg_color=MUL_TURKIS, dynamic_resizing=False,
+        )
+        element_dropdown.pack(fill="x", padx=10, pady=(0, 4))
+
+        element_anteil_label = ctk.CTkLabel(
+            rechte_spalte, text="", font=("Arial", 11), text_color=("gray30", "gray70"), anchor="w",
+        )
+        element_anteil_label.pack(fill="x", padx=10, pady=(0, 10))
+
+        # --- Farbskalierung-Umschalter: Linear (Obergrenze = tatsaechliches
+        # Maximum) vs. p99 (Obergrenze = 99. Perzentil, kappt Ausreisser fuer
+        # mehr Kontrast im relevanten Bereich). Aendert NUR die Obergrenze
+        # der Farbnormierung, siehe SEM_FARBSKALIERUNG_OPTIONEN und
+        # _sem_baue_element_farbbild. ---
+        ctk.CTkFrame(rechte_spalte, height=2, fg_color=("gray75", "gray30")).pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(rechte_spalte, text="Farbskalierung", font=("Arial", 13, "bold")).pack(
+            fill="x", padx=10, pady=(0, 3)
+        )
+
+        farbskalierung_zeile = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+        farbskalierung_zeile.pack(fill="x", padx=10, pady=(0, 4))
+
+        farbskalierung_button = ctk.CTkButton(
+            farbskalierung_zeile, text="", fg_color=MUL_TURKIS, border_width=1,
+        )
+
+        def _farbskalierung_label():
+            return SEM_FARBSKALIERUNG_LABELS.get(zustand.get("farbskalierung", "p99"), "p99")
+
+        def _farbskalierung_umschalten():
+            zustand["farbskalierung"] = (
+                "p99" if zustand.get("farbskalierung", "p99") == "linear" else "linear"
+            )
+            farbskalierung_button.configure(text=f"↔ {_farbskalierung_label()}")
+            self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+            zeichne()
+
+        farbskalierung_button.configure(text=f"↔ {_farbskalierung_label()}", command=_farbskalierung_umschalten)
+        farbskalierung_button.pack(fill="x")
+
+        ctk.CTkLabel(
+            rechte_spalte,
+            text=(
+                "Linear: volles Wertespektrum inkl. Ausreißern (0-Maximum). "
+                "p99: obere Grenze = 99. Perzentil, kappt die obersten ~1 % - "
+                "macht schwächere Strukturen im Rest der Karte sichtbarer. "
+                "Rohdaten und Pixelgeometrie bleiben in beiden Fällen unverändert."
+            ),
+            font=("Arial", 10), text_color=("gray30", "gray70"),
+            anchor="w", justify="left", wraplength=220,
+        ).pack(fill="x", padx=10, pady=(4, 10))
 
         def _element_haeufigkeiten():
             """
@@ -5825,16 +5975,33 @@ class LaborApp(ctk.CTk):
                 return {}
             return {element: float(np.nanmean(karte)) for element, karte in karten.items()}
 
-        def _baue_element_zeilen():
-            for kind in element_liste_frame.winfo_children():
-                kind.destroy()
+        def _element_im_dropdown_gewaehlt(gewaehltes_element):
+            zustand["ausgewaehltes_element"] = gewaehltes_element
+            self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+            _aktualisiere_anteil_label()
+            zeichne()
 
+        def _aktualisiere_anteil_label():
+            haeufigkeiten = _element_haeufigkeiten()
+            element = zustand.get("ausgewaehltes_element")
+            anteil = haeufigkeiten.get(element) if element else None
+            element_anteil_label.configure(
+                text=f"Ø Flächenanteil: {anteil:.1f} %" if anteil is not None else ""
+            )
+
+        def _baue_element_zeilen():
+            """
+            Befuellt das Element-Dropdown mit den Elementen des aktuell
+            geladenen Versuchs (sortiert nach zustand["element_sortierung"])
+            und waehlt das in zustand["ausgewaehltes_element"] hinterlegte
+            Element an (Fallback: haeufigstes bzw. erstes Element - siehe
+            auch der analoge Fallback direkt in zeichne()).
+            """
             alle_elemente = list(zustand.get("element_farben", {}).keys())
             if not alle_elemente:
-                ctk.CTkLabel(
-                    element_liste_frame, text="Versuch auswählen, um Elemente zu laden.",
-                    text_color=("gray40", "gray60"), wraplength=220,
-                ).pack(padx=10, pady=10)
+                element_dropdown.configure(values=["–"])
+                element_dropdown.set("–")
+                element_anteil_label.configure(text="")
                 return
 
             haeufigkeiten = _element_haeufigkeiten()
@@ -5847,55 +6014,14 @@ class LaborApp(ctk.CTk):
             else:
                 elemente = sorted(alle_elemente)
 
-            for element in elemente:
-                zeile = ctk.CTkFrame(element_liste_frame, fg_color=("gray90", "gray20"))
-                zeile.pack(fill="x", padx=10, pady=3)
+            element_dropdown.configure(values=elemente, command=_element_im_dropdown_gewaehlt)
 
-                sichtbar_var = ctk.BooleanVar(value=zustand["element_sichtbar"].get(element, True))
-
-                def _sichtbar_geaendert(element=element, var=sichtbar_var):
-                    zustand["element_sichtbar"][element] = bool(var.get())
-                    self.speichere_diagramm_einstellungen(projekt, methode, zustand)
-                    zeichne()
-
-                # Beschriftung inkl. mittlerem Flächenanteil, z.B. "C  45.2 %"
-                # (nur wenn schon Daten geladen sind - vor der ersten
-                # Versuchsauswahl gibt es noch keine Prozentwerte).
-                anteil = haeufigkeiten.get(element)
-                beschriftung = f"{element}   {anteil:.1f} %" if anteil is not None else element
-
-                ctk.CTkCheckBox(
-                    zeile, text=beschriftung, variable=sichtbar_var, command=_sichtbar_geaendert,
-                ).pack(side="left", padx=(8, 4), pady=6, fill="x", expand=True)
-
-                # Farbe absichern: hover_color (anders als fg_color) akzeptiert
-                # bei CTkButton kein "transparent" - falls in den gespeicherten
-                # Einstellungen (z.B. aeltere/kaputte diagramm_einstellungen.json)
-                # aus irgendeinem Grund kein gueltiger Hex-Wert steht, faengt
-                # das hier ab, statt die ganze Seite mit ValueError abstuerzen
-                # zu lassen.
-                aktuelle_farbe = self._sem_sichere_hex_farbe(
-                    zustand["element_farben"].get(element)
-                )
-                zustand["element_farben"][element] = aktuelle_farbe
-                farb_button = ctk.CTkButton(
-                    zeile, text="", width=28, height=20, fg_color=aktuelle_farbe,
-                    hover_color=aktuelle_farbe, border_width=1, border_color=("gray50", "gray50"),
-                )
-
-                def _farbe_waehlen(element=element, button=farb_button):
-                    start_farbe = self._sem_sichere_hex_farbe(zustand["element_farben"].get(element))
-                    ergebnis = colorchooser.askcolor(color=start_farbe, title=f"Farbe für {element}")
-                    neue_farbe_hex = ergebnis[1] if ergebnis else None
-                    if not neue_farbe_hex:
-                        return
-                    zustand["element_farben"][element] = neue_farbe_hex
-                    button.configure(fg_color=neue_farbe_hex, hover_color=neue_farbe_hex)
-                    self.speichere_diagramm_einstellungen(projekt, methode, zustand)
-                    zeichne()
-
-                farb_button.configure(command=_farbe_waehlen)
-                farb_button.pack(side="right", padx=(4, 8), pady=6)
+            aktuelles_element = zustand.get("ausgewaehltes_element")
+            if aktuelles_element not in elemente:
+                aktuelles_element = elemente[0]
+                zustand["ausgewaehltes_element"] = aktuelles_element
+            element_dropdown.set(aktuelles_element)
+            _aktualisiere_anteil_label()
 
         aktualisiere_element_panel["fn"] = _baue_element_zeilen
 

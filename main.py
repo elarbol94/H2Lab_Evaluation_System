@@ -3011,6 +3011,19 @@ class LaborApp(ctk.CTk):
         karten = karten_prozent if zustand.get("normieren", True) else elementkarten
         maske = self._sem_wende_filter_an(karten, zustand.get("filter", []))
 
+        # Der schwarze Hintergrund AUSSERHALB der Probe (Vakuum/kein
+        # Material) hat ueberall ein Rohsignal von 0 - bei den normierten
+        # %-Karten wird das dann ebenfalls ueberall zu 0 %, wodurch ein
+        # Filter wie "C < 30" dort faelschlich IMMER zutrifft und der
+        # Clusteralgorithmus den gesamten Hintergrund als (einen riesigen)
+        # Cluster erkennt -> Umriss liegt dann rund um die Probe statt nur
+        # um die tatsaechlich gefilterten Bereiche. Deshalb hier explizit
+        # ausschliessen: nur Pixel MIT Rohsignal (= echte Probenflaeche)
+        # duerfen ueberhaupt in die Maske/den Cluster-Umriss.
+        probe_maske = np.sum(np.stack(list(elementkarten.values()), axis=0), axis=0) > 0.0
+        if maske is not None:
+            maske = maske & probe_maske
+
         if ausgangsbild is not None and ist_farbig:
             basis_grau = np.mean(np.asarray(ausgangsbild, dtype=np.float64)[..., :3], axis=-1)
         elif ausgangsbild is not None:
@@ -3018,10 +3031,19 @@ class LaborApp(ctk.CTk):
         else:
             basis_grau = np.sum(np.stack(list(elementkarten.values()), axis=0), axis=0)
 
+        # Hintergrund (keine Probe) soll WEISS erscheinen statt schwarz -
+        # dafuer die Achsenflaeche weiss faerben und den Hintergrund im
+        # Graustufenbild auf NaN setzen (wird dann transparent, die weisse
+        # Achsenflaeche scheint durch).
+        ax_rechts.set_facecolor("white")
+        basis_grau_anzeige = np.array(basis_grau, dtype=np.float64, copy=True)
+        if probe_maske.shape == basis_grau.shape:
+            basis_grau_anzeige[~probe_maske] = np.nan
+
         gefiltert_anzeige = np.array(basis_grau, dtype=np.float64, copy=True)
         if maske is not None and maske.shape == basis_grau.shape:
             gefiltert_anzeige[~maske] = np.nan
-        ax_rechts.imshow(basis_grau, cmap="gray", alpha=0.35)
+        ax_rechts.imshow(basis_grau_anzeige, cmap="gray", alpha=0.35)
         ax_rechts.imshow(gefiltert_anzeige, cmap="viridis")
 
         anzahl_cluster = 0
@@ -3088,7 +3110,7 @@ class LaborApp(ctk.CTk):
             "filter": [dict(f) for f in SEM_FILTER_STANDARD_LISTE],
             "normieren": True,
             "cluster_anzeigen": True,
-            "mikrometer_pro_pixel": 1.0,
+            "mikrometer_pro_pixel": 0.875,
         }
         zustand = self.lade_rohdaten_filter_einstellungen_fuer_versuch(
             projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, versuche[0][2]), zustand_standard
@@ -3550,7 +3572,7 @@ class LaborApp(ctk.CTk):
 
                 ctk.CTkButton(
                     kopfzeile_filter, text="✕", width=28, fg_color="transparent",
-                    hover_color="#aa3333", command=_entfernen,
+                    text_color=("black", "white"), hover_color="#aa3333", command=_entfernen,
                 ).pack(side="right", padx=(2, 0))
 
                 # --- Element-"Chips": ein Filter kann sich auf MEHRERE
@@ -5153,7 +5175,7 @@ class LaborApp(ctk.CTk):
             # Pixel" kommt aus dem Rohdaten-Tab, siehe mikrometer_pro_pixel). ---
             kalibrierung = self.lade_rohdaten_filter_einstellungen_fuer_versuch(
                 projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, pfad),
-                {"mikrometer_pro_pixel": 1.0},
+                {"mikrometer_pro_pixel": 0.875},
             )
             self._sem_aktualisiere_massstabsbalken(ax, kalibrierung.get("mikrometer_pro_pixel", 0.0))
 

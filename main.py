@@ -402,6 +402,23 @@ EXTRA_DATENQUELLEN = [
 ]
 
 class LaborApp(ctk.CTk):
+    # Feste Länge des SEM-Maßstabsbalkens in Mikrometer (unabhängig vom
+    # Zoomstand). Kalibrierung erfolgt über "mikrometer_pro_pixel"
+    # (Standard: 0.84427 µm/Pixel, siehe Rohdaten-Tab).
+    #
+    # BERECHNUNG DES MASSTABSBALKENS (gemäß Dokumentation):
+    # =====================================================
+    # 1. Gewünschte Maßstabslänge: 200 µm = 0.2 mm (MASSSTABSBALKEN_LAENGE_UM)
+    # 2. Pixelgröße: 0.84427 µm/Pixel (aus H5OINA oder manuell gesetzt)
+    # 3. Formel: Pixel = µm ÷ µm_pro_Pixel
+    # 4. Berechnung: 200 µm ÷ 0.84427 µm/Pixel = 236.89 Pixel ≈ 237 Pixel
+    #
+    # Beim Zoomen im Browser:
+    # - Die physikalische Beschriftung bleibt "0.2 mm"
+    # - Die Pixel-Länge wird mit Zoom-Faktor multipliziert
+    # - Das Verhältnis zwischen Balken und Bild bleibt korrekt
+    MASSSTABSBALKEN_LAENGE_UM = 200
+
     def __init__(self):
         super().__init__()
         self.title("MUL - H2Lab Staub-System")
@@ -419,6 +436,11 @@ class LaborApp(ctk.CTk):
 
         self.aktuelle_sheet_daten = None  # Zeilen aus dem Datenblatt des aktuell gewählten Projekts
         self.ergebnisse_cache = {}  # {Methode: (header, gefilterte_zeilen)} - vorberechnet pro Projektwechsel
+        # {versuch_pfad: (um_pro_px oder None, fehlermeldung oder None)} -
+        # Cache fuer die aus der H5OINA-Datei gelesene Pixelkalibrierung,
+        # damit die (teure) H5-Datei nicht bei jedem Redraw/Zoom neu
+        # eingelesen wird (siehe _sem_ermittle_um_pro_pixel).
+        self._sem_h5oina_kalibrierung_cache = {}
 
         self.grid_columnconfigure(0, weight=1)
 
@@ -2684,6 +2706,282 @@ class LaborApp(ctk.CTk):
     # SEM: Rohdaten laden (Elementkarten-TIFs), normieren, filtern,
     # Cluster-Umrisse berechnen - siehe baue_rohdaten_tab_sem fuer die UI.
     # ------------------------------------------------------------------
+    def _sem_finde_h5oina_datei(self, versuch_pfad):
+        """
+        Sucht im Versuchsordner (rekursiv) nach einer H5OINA/HDF5-Datei mit
+        der Kalibrierungs-Metadaten (X Step/Y Step). Portiert aus
+        SEM/filtering.py:locate_sample_h5oina_file.
+        Gibt (pfad_oder_None, fehlermeldung_oder_None) zurueck.
+        """
+        if os.path.isfile(versuch_pfad):
+            suchordner = os.path.dirname(versuch_pfad)
+        else:
+            suchordner = versuch_pfad
+        if not os.path.isdir(suchordner):
+            return None, "Versuchsordner nicht gefunden"
+
+        endungen = {".h5oina", ".h5", ".hdf5", ".hdf"}
+        kandidaten = []
+        for wurzel, _unterordner, dateien in os.walk(suchordner):
+            for datei in dateien:
+                if os.path.splitext(datei)[1].lower() in endungen:
+                    kandidaten.append(os.path.join(wurzel, datei))
+        if not kandidaten:
+            return None, "keine H5OINA-Datei gefunden"
+
+        bevorzugt = [
+            p for p in kandidaten
+            if "oina" in os.path.basename(p).lower() or p.lower().endswith(".h5oina")
+        ]
+        pool = bevorzugt or kandidaten
+        if len(pool) > 1:
+            namen = ", ".join(os.path.basename(p) for p in pool[:3])
+            return None, f"mehrere H5OINA-Kandidaten gefunden: {namen}"
+        return pool[0], None
+
+    @staticmethod
+    def _sem_h5_normalisiere_key(name):
+        return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+    @classmethod
+    def _sem_h5_einheit_aus_key(cls, name):
+        """Erkennt die Einheit anhand des Metadaten-Schlüsselnamens (z.B.
+        'PixelSizeUm', 'XStepNm', ...) und gibt den Umrechnungsfaktor nach
+        µm zurück. Portiert aus SEM/filtering.py:_unit_scale_from_key."""
+        key = cls._sem_h5_normalisiere_key(name)
+        if not key:
+            return None
+        if any(tok in key for tok in ("umperpixel", "micronperpixel", "micronsperpixel", "micrometerperpixel", "micrometersperpixel")):
+            return 1.0
+        if any(tok in key for tok in ("pixelsizeum", "pixelwidthum", "xstepum", "xscaleum", "stepsizeum")):
+            return 1.0
+        if any(tok in key for tok in ("pixelsizenm", "pixelwidthnm", "xstepnm", "xscalenm", "stepsizenm")):
+            return 1e-3
+        if any(tok in key for tok in ("pixelsizemm", "pixelwidthmm", "xstepmm", "xscalemm", "stepsizemm")):
+            return 1000.0
+        if any(tok in key for tok in ("pixelsizem", "pixelwidthm", "xstepm", "xscalem", "stepsizem")):
+            return 1e6
+        return None
+
+    @classmethod
+    def _sem_h5_einheit_aus_text(cls, einheit):
+        """Erkennt die Einheit anhand eines Text-Attributs (z.B. 'µm',
+        'nm', ...). Portiert aus SEM/filtering.py:_unit_scale_from_unit_text."""
+        if isinstance(einheit, bytes):
+            try:
+                einheit = einheit.decode("utf-8", errors="ignore")
+            except Exception:
+                return None
+        key = cls._sem_h5_normalisiere_key(str(einheit))
+        if key in {"um", "micron", "microns", "micrometer", "micrometers"}:
+            return 1.0
+        if key in {"nm", "nanometer", "nanometers"}:
+            return 1e-3
+        if key in {"mm", "millimeter", "millimeters"}:
+            return 1000.0
+        if key in {"m", "meter", "meters"}:
+            return 1e6
+        return None
+
+    @staticmethod
+    def _sem_h5_normalisiere_skalar(wert):
+        """Wandelt einen H5-Datensatzwert (Zahl, 1-elementiges Array oder
+        Zahlen-String) in einen einzelnen positiven float um, sonst None.
+        Portiert aus SEM/filtering.py:_normalize_h5_scalar."""
+        import numpy as np
+
+        if isinstance(wert, bytes):
+            try:
+                wert = wert.decode("utf-8", errors="ignore")
+            except Exception:
+                return None
+        if isinstance(wert, str):
+            treffer = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", wert)
+            if not treffer:
+                return None
+            wert = treffer.group(0)
+        try:
+            array = np.asarray(wert)
+        except Exception:
+            return None
+        if array.size != 1:
+            return None
+        try:
+            skalar = float(array.reshape(-1)[0])
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(skalar) or skalar <= 0:
+            return None
+        return skalar
+
+    def _sem_h5_lese_wert_und_einheit(self, handle, datensatz_pfad):
+        try:
+            datensatz = handle[datensatz_pfad]
+        except Exception:
+            return None, None
+        wert = None
+        einheit_skalierung = None
+        try:
+            wert = self._sem_h5_normalisiere_skalar(datensatz[()])
+        except Exception:
+            wert = None
+        try:
+            einheit_skalierung = self._sem_h5_einheit_aus_text(datensatz.attrs.get("Unit"))
+        except Exception:
+            einheit_skalierung = None
+        return wert, einheit_skalierung
+
+    def _sem_h5_lese_step_paar_um(self, handle, x_pfad, y_pfad):
+        """Liest X/Y Step, rechnet in µm um und mittelt - verwirft das
+        Ergebnis, wenn X/Y-Schrittweite um mehr als 5% voneinander
+        abweichen (rechteckige statt quadratische Pixel). Portiert aus
+        SEM/filtering.py:_read_h5_step_pair_um."""
+        x_wert, x_skalierung = self._sem_h5_lese_wert_und_einheit(handle, x_pfad)
+        y_wert, y_skalierung = self._sem_h5_lese_wert_und_einheit(handle, y_pfad)
+        if x_wert is None or y_wert is None or x_skalierung is None or y_skalierung is None:
+            return None, None
+        x_um = float(x_wert) * float(x_skalierung)
+        y_um = float(y_wert) * float(y_skalierung)
+        if x_um <= 0.0 or y_um <= 0.0:
+            return None, None
+        rel_diff = abs(x_um - y_um) / max(x_um, y_um)
+        if rel_diff > 0.05:
+            return None, "widersprüchliche Pixelgrößen-Metadaten in der H5OINA-Datei (X/Y weichen >5% ab)"
+        return float(0.5 * (x_um + y_um)), None
+
+    def _sem_lese_h5oina_um_pro_pixel(self, pfad, quelle="auto"):
+        """
+        Liest die Mikrometer/Pixel-Kalibrierung aus einer H5OINA-Datei.
+        WICHTIG: EDS-Elementkarten und das Electron-Image(Backscatter)-Bild
+        haben in H5OINA-Dateien i.d.R. UNTERSCHIEDLICHE Pixelaufloesungen
+        (die EDS-Karte ist meist deutlich groeber gebinnt als das hochaufgeloeste
+        Electron Image, auch wenn beide dasselbe physische Sichtfeld zeigen).
+        `quelle` legt fest, welcher Header-Pfad verwendet werden soll:
+          - "eds":      nur /1/EDS/Header/X|Y Step (fuer Elementkarten-TIFs)
+          - "electron": nur /1/Electron Image/Header/X|Y Step (fuer Backscatter)
+          - "auto":     wie bisher - erst EDS, dann Electron Image, dann
+                        generischer Attribut-Scan (nur sinnvoll, wenn nicht
+                        bekannt ist, welcher Bildtyp kalibriert werden soll).
+        Portiert aus SEM/filtering.py:read_h5oina_um_per_pixel.
+        Gibt (um_pro_pixel_oder_None, fehlermeldung_oder_None) zurueck.
+        """
+        import numpy as np
+        try:
+            import h5py
+        except ImportError:
+            return None, "h5py ist nicht installiert ('pip install h5py')"
+
+        if quelle == "eds":
+            pfad_paare = (("/1/EDS/Header/X Step", "/1/EDS/Header/Y Step"),)
+        elif quelle == "electron":
+            pfad_paare = (("/1/Electron Image/Header/X Step", "/1/Electron Image/Header/Y Step"),)
+        else:
+            pfad_paare = (
+                ("/1/EDS/Header/X Step", "/1/EDS/Header/Y Step"),
+                ("/1/Electron Image/Header/X Step", "/1/Electron Image/Header/Y Step"),
+            )
+
+        try:
+            with h5py.File(pfad, "r") as handle:
+                for x_pfad, y_pfad in pfad_paare:
+                    treffer, fehler = self._sem_h5_lese_step_paar_um(handle, x_pfad, y_pfad)
+                    if treffer is not None:
+                        return treffer, None
+                    if fehler is not None:
+                        return None, fehler
+
+                if quelle != "auto":
+                    # Fuer eine explizit angeforderte Quelle (eds/electron)
+                    # NICHT auf den generischen Attribut-Scan zurueckfallen -
+                    # der wuerde nicht zwischen EDS- und Electron-Image-
+                    # Aufloesung unterscheiden koennen und koennte den
+                    # jeweils falschen (weil vom anderen Bildtyp stammenden)
+                    # Wert liefern.
+                    bezeichnung = "EDS" if quelle == "eds" else "Electron Image"
+                    return None, f"keine {bezeichnung}-Pixelgrößen-Metadaten in der H5OINA-Datei gefunden"
+
+                skalar_werte = []
+
+                def sammle_attribute(prefix, obj):
+                    try:
+                        attribute = obj.attrs.items()
+                    except Exception:
+                        return
+                    for name, roh in attribute:
+                        wert = self._sem_h5_normalisiere_skalar(roh)
+                        if wert is not None:
+                            skalar_werte.append((f"{prefix}/@{name}", wert))
+
+                def besuche(name, obj):
+                    prefix = f"/{name}" if name else "/"
+                    sammle_attribute(prefix, obj)
+                    if getattr(obj, "shape", None) is not None:
+                        try:
+                            if int(np.prod(obj.shape)) == 1:
+                                wert = self._sem_h5_normalisiere_skalar(obj[()])
+                                if wert is not None:
+                                    skalar_werte.append((prefix, wert))
+                        except Exception:
+                            return
+
+                sammle_attribute("/", handle)
+                handle.visititems(besuche)
+        except Exception as exc:
+            return None, f"H5OINA-Datei nicht lesbar: {type(exc).__name__}: {exc}"
+
+        treffer = []
+        for name, wert in skalar_werte:
+            skalierung = self._sem_h5_einheit_aus_key(name)
+            if skalierung is not None:
+                treffer.append(wert * skalierung)
+        eindeutige_treffer = sorted({round(wert, 9) for wert in treffer if wert > 0})
+        if len(eindeutige_treffer) == 1:
+            return float(eindeutige_treffer[0]), None
+        if len(eindeutige_treffer) > 1:
+            return None, "widersprüchliche Pixelgrößen-Metadaten in der H5OINA-Datei"
+        return None, "keine Pixelgrößen-Metadaten in der H5OINA-Datei gefunden"
+
+    def _sem_ermittle_um_pro_pixel(self, versuch_pfad, manueller_wert, quelle="auto"):
+        """
+        Ermittelt die Mikrometer/Pixel-Kalibrierung fuer den Maßstabsbalken
+        EINES BESTIMMTEN BILDTYPS (`quelle`: "eds" fuer Elementkarten,
+        "electron" fuer das Backscatter-/Electron-Image, "auto" wenn der
+        Bildtyp nicht bekannt/egal ist):
+        1. Bevorzugt wird der reale, probenspezifische Wert aus der
+           H5OINA-Datei des Versuchsordners gelesen (X/Y Step-Mittelwert
+           DES JEWEILIGEN HEADERS), analog zur SEM-Web-App (siehe
+           SEM/filtering.py). EDS-Elementkarten und Electron-Image haben
+           i.d.R. unterschiedliche Pixelaufloesungen trotz gleichem
+           Sichtfeld - deshalb NIE einen fuer den einen Bildtyp gelesenen
+           Wert fuer den anderen wiederverwenden. Das Ergebnis wird pro
+           (Versuchsordner, Quelle) zwischengespeichert (H5-Datei wird nur
+           einmal gelesen, nicht bei jedem Redraw/Zoom).
+        2. Ist keine (eindeutige) H5OINA-Datei vorhanden/lesbar oder fehlt
+           der jeweilige Header, wird auf den manuell im Rohdaten-Tab
+           eingestellten Wert zurueckgefallen (Kalibrierungsfeld
+           "mikrometer_pro_pixel") - anders als die Web-App (die dann GAR
+           KEINEN Balken zeigt), damit die Desktop-App auch ohne H5OINA-
+           Datei weiter nutzbar bleibt.
+        Gibt (um_pro_pixel, herkunft) zurueck, mit herkunft in
+        {"h5oina", "manuell"}.
+        """
+        cache_schluessel = (versuch_pfad, quelle)
+        if cache_schluessel in self._sem_h5oina_kalibrierung_cache:
+            um_pro_px, fehler = self._sem_h5oina_kalibrierung_cache[cache_schluessel]
+        else:
+            h5oina_pfad, fehler_suche = self._sem_finde_h5oina_datei(versuch_pfad)
+            if h5oina_pfad is None:
+                um_pro_px, fehler = None, fehler_suche
+            else:
+                um_pro_px, fehler = self._sem_lese_h5oina_um_pro_pixel(h5oina_pfad, quelle=quelle)
+            self._sem_h5oina_kalibrierung_cache[cache_schluessel] = (um_pro_px, fehler)
+            if fehler:
+                print(f"[SEM Maßstab] {versuch_pfad} ({quelle}): automatische Kalibrierung nicht möglich ({fehler}) - verwende manuellen Wert.")
+
+        if um_pro_px:
+            return um_pro_px, "h5oina"
+        return manueller_wert, "manuell"
+
     def _sem_finde_tif_ordner(self, versuch_pfad):
         """
         Sucht den Ordner mit den Elementkarten-TIFs zu einem SEM-Versuch.
@@ -2759,26 +3057,34 @@ class LaborApp(ctk.CTk):
         Waehlt/laedt das Bild fuer das linke ("Ausgangsbild"-)Diagramm:
         bevorzugt Backscatter-Übersicht, sonst das EDS-Layered-Komposit,
         sonst (Fallback) die Summe aller Elementkarten als Graustufenbild.
-        Gibt (bild_array, ist_farbig) zurueck, oder (None, False).
+        Gibt (bild_array, ist_farbig, kalibrierung_quelle) zurueck, oder
+        (None, False, "electron"). `kalibrierung_quelle` ist "electron" fuer
+        das (hoeher aufgeloeste) Backscatter-/Electron-Image, sonst "eds" -
+        WICHTIG fuer den Maßstabsbalken, da EDS-Elementkarten und Electron
+        Image i.d.R. unterschiedliche µm/Pixel-Aufloesungen haben (siehe
+        _sem_lese_h5oina_um_pro_pixel).
         """
         from PIL import Image
         import numpy as np
 
         backscatter_pfad = self._sem_finde_backscatter_pfad(versuch_pfad)
-        for pfad, ist_kandidat_farbig in ((backscatter_pfad, False), (eds_layered_pfad, True)):
+        for pfad, ist_kandidat_farbig, kalibrierung_quelle in (
+            (backscatter_pfad, False, "electron"),
+            (eds_layered_pfad, True, "eds"),
+        ):
             if not pfad:
                 continue
             try:
                 with Image.open(pfad) as bild:
                     array = np.asarray(bild)
-                return array, (array.ndim == 3)
+                return array, (array.ndim == 3), kalibrierung_quelle
             except Exception as e:
                 print(f"[SEM Ausgangsbild Fehler] {pfad}: {e}")
 
         if elementkarten:
             summe = np.sum(np.stack(list(elementkarten.values()), axis=0), axis=0)
-            return summe, False
-        return None, False
+            return summe, False, "eds"
+        return None, False, "electron"
 
     def _sem_normalisiere_elementkarten(self, elementkarten):
         """
@@ -2884,21 +3190,18 @@ class LaborApp(ctk.CTk):
 
     def _sem_aktualisiere_massstabsbalken(self, ax, um_pro_px):
         """
-        Zeichnet/aktualisiert den Maßstabsbalken in `ax` DYNAMISCH basierend
-        auf dem AKTUELL SICHTBAREN Ausschnitt (ax.get_xlim()/get_ylim()) -
-        dadurch passt sich die Beschriftung automatisch an, wenn per
-        Strg+Mausrad/Lupe/Verschieben gezoomt bzw. gepannt wird (z.B. "50 µm"
-        in der Vollansicht -> "5 µm" stark reingezoomt). `um_pro_px` ist die
-        Kalibrierung Mikrometer/Pixel (vom Nutzer editierbar im Rohdaten-Tab).
-        Bei um_pro_px <= 0 wird nur der vorherige Balken entfernt.
+        Zeichnet/aktualisiert den Maßstabsbalken in `ax` mit einer FESTEN
+        Länge von MASSSTABSBALKEN_LAENGE_UM (Standard: 200 µm), umgerechnet
+        über die Kalibrierung `um_pro_px` (Mikrometer/Pixel, Standard:
+        0.84427 µm/Pixel, vom Nutzer editierbar im Rohdaten-Tab) in die
+        entsprechende Pixel-Breite. Bei um_pro_px <= 0 wird nur der
+        vorherige Balken entfernt.
 
         Vorherige Balken-Elemente (Linie + Text) werden VOR dem Neuzeichnen
         entfernt (in ax._sem_massstab_artists zwischengespeichert) - sonst
         wuerden sich bei jedem Zoom/Pan-Schritt immer mehr Balken uebereinander
         stapeln.
         """
-        import math
-
         for artist in getattr(ax, "_sem_massstab_artists", []):
             try:
                 artist.remove()
@@ -2915,17 +3218,19 @@ class LaborApp(ctk.CTk):
         if sichtbare_breite_px <= 0:
             return
 
-        ziel_breite_um = sichtbare_breite_px * um_pro_px * 0.2
-        if ziel_breite_um <= 0:
+        # Feste Balkenlaenge von 200 Mikrometer (statt automatisch
+        # gewaehlter "schoener" Rundungszahl basierend auf dem sichtbaren
+        # Ausschnitt). Bei Bedarf ueber MASSSTABSBALKEN_LAENGE_UM anpassbar.
+        #
+        # === MASSTABSBALKEN-BERECHNUNG (nach Dokumentation - Schritt 6) ===
+        # Gewünschte Länge: 200 µm (= 0.2 mm)
+        # Pixelgröße: 0.84427 µm/Pixel (aus H5OINA oder manuell)
+        # Berechnung: balken_px = balken_um / um_pro_px
+        #            balken_px = 200 µm / 0.84427 µm/Pixel
+        #            balken_px ≈ 236.89 Pixel → 237 Pixel (gerundet)
+        balken_px, balken_um = self._sem_berechne_massstabsbalken_pixel(um_pro_px)
+        if balken_px is None or balken_um is None:
             return
-        exponent = math.floor(math.log10(ziel_breite_um))
-        balken_um = 10 ** (exponent + 1)
-        for basis in (1, 2, 5, 10):
-            kandidat = basis * (10 ** exponent)
-            if kandidat >= ziel_breite_um:
-                balken_um = kandidat
-                break
-        balken_px = balken_um / um_pro_px
 
         x_min = min(xlim)
         rand_x = x_min + sichtbare_breite_px * 0.05
@@ -2945,22 +3250,57 @@ class LaborApp(ctk.CTk):
 
         linie, = ax.plot(
             [rand_x, rand_x + balken_px], [y_balken, y_balken],
-            color="white", linewidth=3, solid_capstyle="butt", zorder=5,
+            color="black", linewidth=3, solid_capstyle="butt", zorder=5,
         )
         beschriftung = f"{balken_um:g} µm"
         text = ax.text(
             rand_x + balken_px / 2, text_y, beschriftung,
-            color="white", fontsize=9, fontweight="bold", ha="center", va=va, zorder=5,
+            color="black", fontsize=9, fontweight="bold", ha="center", va=va, zorder=5,
             path_effects=self._sem_massstab_texteffekt(),
         )
         ax._sem_massstab_artists = [linie, text]
 
+    def _sem_berechne_massstabsbalken_pixel(self, um_pro_px):
+        """
+        Berechnet die Pixel-Breite des Maßstabsbalkens nach der
+        offiziellen Dokumentation (Schritt 6):
+
+        Formel: L_Pixel = L_µm ÷ s_µm/Pixel
+
+        Args:
+            um_pro_px (float): Pixelgröße in Mikrometer/Pixel
+                               (z.B. 0.84427 µm/Pixel aus H5OINA)
+
+        Returns:
+            tuple: (balken_px, balken_um)
+                   - balken_px: Pixel-Breite (gerundet), z.B. 237 Pixel
+                   - balken_um: Mikrometer-Länge, z.B. 200 µm
+
+        Beispiel:
+            >>> app = LaborApp()
+            >>> px, um = app._sem_berechne_massstabsbalken_pixel(0.84427)
+            >>> print(f"Balken: {um} µm = {px:.0f} Pixel")
+            Balken: 200 µm = 237 Pixel
+
+        Dokumentation:
+            - L_µm = 200 µm (MASSSTABSBALKEN_LAENGE_UM, feste Länge)
+            - s_µm/Pixel = 0.84427 µm/Pixel (aus H5OINA oder manuell)
+            - L_Pixel = 200 / 0.84427 = 236.89 ≈ 237 Pixel
+        """
+        if not um_pro_px or um_pro_px <= 0:
+            return None, None
+
+        balken_um = self.MASSSTABSBALKEN_LAENGE_UM
+        balken_px = balken_um / um_pro_px
+
+        return balken_px, balken_um
+
     def _sem_massstab_texteffekt(self):
-        # Duenne schwarze Kontur um die weisse Maßstabs-Beschriftung, damit
-        # sie auch auf hellem Bildhintergrund lesbar bleibt.
+        # Duenne weisse Kontur um die schwarze Maßstabs-Beschriftung, damit
+        # sie auch auf dunklem Bildhintergrund lesbar bleibt.
         try:
             import matplotlib.patheffects as pe
-            return [pe.withStroke(linewidth=2, foreground="black")]
+            return [pe.withStroke(linewidth=2, foreground="white")]
         except ImportError:
             return []
 
@@ -2985,7 +3325,7 @@ class LaborApp(ctk.CTk):
         ax_rechts.clear()
 
         elementkarten, eds_layered_pfad = self._sem_lade_elementkarten(voller_pfad)
-        ausgangsbild, ist_farbig = self._sem_lade_ausgangsbild(voller_pfad, elementkarten, eds_layered_pfad)
+        ausgangsbild, ist_farbig, kalibrierung_quelle = self._sem_lade_ausgangsbild(voller_pfad, elementkarten, eds_layered_pfad)
 
         ax_links.set_title("Ausgangsbild")
         if ausgangsbild is not None:
@@ -3071,7 +3411,9 @@ class LaborApp(ctk.CTk):
         ax_rechts.set_xticks([])
         ax_rechts.set_yticks([])
 
-        um_pro_px = zustand.get("mikrometer_pro_pixel", 0.0)
+        um_pro_px, _um_pro_px_quelle = self._sem_ermittle_um_pro_pixel(
+            voller_pfad, zustand.get("mikrometer_pro_pixel", 0.0)
+        )
         for ax_massstab in (ax_links, ax_rechts):
             # Vollansicht (Grenzen direkt nach dem Neuzeichnen, bevor
             # irgendein Pan/Zoom passiert ist) fuer den Doppelklick-Reset
@@ -3117,7 +3459,7 @@ class LaborApp(ctk.CTk):
             "filter": [dict(f) for f in SEM_FILTER_STANDARD_LISTE],
             "normieren": True,
             "cluster_anzeigen": True,
-            "mikrometer_pro_pixel": 0.875,
+            "mikrometer_pro_pixel": 0.84427,
         }
         zustand = self.lade_rohdaten_filter_einstellungen_fuer_versuch(
             projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, versuche[0][2]), zustand_standard
@@ -5143,7 +5485,7 @@ class LaborApp(ctk.CTk):
                 {
                     "filter": [dict(f) for f in SEM_FILTER_STANDARD_LISTE],
                     "normieren": True,
-                    "mikrometer_pro_pixel": 0.875,
+                    "mikrometer_pro_pixel": 0.84427,
                 },
             )
             karten_fuer_filter = karten_prozent if rohdaten_zustand.get("normieren", True) else elementkarten
@@ -5208,13 +5550,18 @@ class LaborApp(ctk.CTk):
                     zorder=7,
                 )
 
-            # --- Massstabsbalken in Mikrometer (Kalibrierung "Mikrometer/
-            # Pixel" kommt aus dem Rohdaten-Tab, siehe mikrometer_pro_pixel). ---
+            # --- Massstabsbalken in Mikrometer: bevorzugt automatisch aus
+            # der H5OINA-Datei des Versuchsordners gelesen, sonst Fallback
+            # auf den manuell im Rohdaten-Tab hinterlegten Wert (siehe
+            # _sem_ermittle_um_pro_pixel / mikrometer_pro_pixel). ---
             kalibrierung = self.lade_rohdaten_filter_einstellungen_fuer_versuch(
                 projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, pfad),
-                {"mikrometer_pro_pixel": 0.875},
+                {"mikrometer_pro_pixel": 0.84427},
             )
-            self._sem_aktualisiere_massstabsbalken(ax, kalibrierung.get("mikrometer_pro_pixel", 0.0))
+            um_pro_px, _um_pro_px_quelle = self._sem_ermittle_um_pro_pixel(
+                pfad, kalibrierung.get("mikrometer_pro_pixel", 0.0)
+            )
+            self._sem_aktualisiere_massstabsbalken(ax, um_pro_px)
 
             if vorherige_xlim is not None and vorherige_ylim is not None:
                 ax.set_xlim(vorherige_xlim)

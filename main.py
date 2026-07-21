@@ -4612,7 +4612,7 @@ class LaborApp(ctk.CTk):
             if element not in zustand["element_sichtbar"]:
                 zustand["element_sichtbar"][element] = True
 
-    def _sem_baue_overlay_bild(self, elementkarten, zustand, karten_prozent=None):
+    def _sem_baue_overlay_bild(self, elementkarten, zustand, karten_prozent=None, pixel_maske=None):
         """
         Baut das farbige Overlay-Bild: jede sichtbare Elementkarte wird auf
         [0, 1] skaliert (robust, per 99. Perzentil statt Maximum - schuetzt
@@ -4625,6 +4625,11 @@ class LaborApp(ctk.CTk):
         an denen ein Element WENIGER als dieser Prozentsatz zur lokalen
         Zusammensetzung beitraegt, fuer genau dieses Element ausgeblendet -
         so laesst sich z.B. "nur Bereiche mit >= 20% Kupfer" einblenden.
+
+        `pixel_maske` (optional): boolesche Maske (aus den Rohdaten-Tab-
+        Filtern, siehe _sem_wende_filter_an) - ist sie gesetzt, werden NUR
+        die gefilterten Pixel angezeigt; alle anderen erscheinen weiss
+        (statt schwarz), analog zum Rohdaten-Tab.
         """
         import numpy as np
 
@@ -4645,9 +4650,11 @@ class LaborApp(ctk.CTk):
             farbe = self._sem_farbe_hex_zu_rgb(zustand.get("element_farben", {}).get(element, "#ffffff"))
             for kanal in range(3):
                 rgb[..., kanal] += karte_norm * farbe[kanal]
-        if not irgendeins_sichtbar:
-            return np.zeros((*form, 3), dtype=np.float64)
-        return np.clip(rgb, 0.0, 1.0)
+        ergebnis = rgb if irgendeins_sichtbar else np.zeros((*form, 3), dtype=np.float64)
+        ergebnis = np.clip(ergebnis, 0.0, 1.0)
+        if pixel_maske is not None and pixel_maske.shape == form:
+            ergebnis[~pixel_maske] = 1.0
+        return ergebnis
 
     def baue_ergebnisse_tab_sem(self, parent, projekt, methode):
         """
@@ -5120,7 +5127,30 @@ class LaborApp(ctk.CTk):
             # "wie viel % Zink befindet sich an dieser Stelle").
             karten_prozent = self._sem_normalisiere_elementkarten(elementkarten)
             aktuelle_daten["karten_normiert"] = karten_prozent
-            overlay = self._sem_baue_overlay_bild(elementkarten, zustand, karten_prozent=karten_prozent)
+
+            # --- Nur die im Rohdaten-Tab GEFILTERTEN Pixel anzeigen: die
+            # dort eingestellten Schwellwert-Filter (z.B. "C < 30") werden
+            # hier erneut angewendet, alles was NICHT durchkommt (inkl. dem
+            # schwarzen Hintergrund ausserhalb der Probe) wird ausgeblendet
+            # (weiss statt eingefaerbt) - analog zum Rohdaten-Tab. ---
+            rohdaten_zustand = self.lade_rohdaten_filter_einstellungen_fuer_versuch(
+                projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, pfad),
+                {
+                    "filter": [dict(f) for f in SEM_FILTER_STANDARD_LISTE],
+                    "normieren": True,
+                    "mikrometer_pro_pixel": 0.875,
+                },
+            )
+            karten_fuer_filter = karten_prozent if rohdaten_zustand.get("normieren", True) else elementkarten
+            pixel_maske = self._sem_wende_filter_an(karten_fuer_filter, rohdaten_zustand.get("filter", []))
+            probe_maske = np.sum(np.stack(list(elementkarten.values()), axis=0), axis=0) > 0.0
+            if pixel_maske is not None:
+                pixel_maske = pixel_maske & probe_maske
+
+            overlay = self._sem_baue_overlay_bild(
+                elementkarten, zustand, karten_prozent=karten_prozent, pixel_maske=pixel_maske,
+            )
+            ax.set_facecolor("white")
             ax.imshow(overlay)
             ax.set_title(os.path.splitext(os.path.basename(pfad))[0])
 

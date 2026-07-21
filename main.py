@@ -13,6 +13,91 @@ import shutil
 from tkinter import messagebox, colorchooser
 from datetime import datetime
 
+# ============================================================
+# EDS-FILTER-PARSER (Neue Feature: C+O > 15 Syntax)
+# ============================================================
+
+class EDSFilterParser:
+    """Parst und evaluiert EDS-Filterausdrücke wie 'C+O > 15'"""
+    
+    PATTERN = r'([><=!]+)\s*([\d.]+)'
+    VALID_ELEMENTS = {
+        'H', 'C', 'N', 'O', 'F', 'Na', 'Mg', 'Al', 'Si', 'P', 'S', 'Cl',
+        'K', 'Ca', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn',
+        'Br', 'Ag', 'Sn', 'I', 'Pb', 'Au'
+    }
+    
+    @classmethod
+    def parse(cls, filter_string):
+        """
+        Parse Filterstring zu auswertbarer Funktion
+        z.B. "C+O > 15" -> (evaluate_func, None)
+        Returns: (eval_fn, error_msg)
+        """
+        if not filter_string or not filter_string.strip():
+            return None, "Filter ist leer"
+        
+        filter_string = filter_string.strip()
+        match = re.search(cls.PATTERN, filter_string)
+        if not match:
+            return None, "Format: 'C+O > 15' oder '(Fe+Ni) >= 20'"
+        
+        operator = match.group(1)
+        try:
+            threshold = float(match.group(2))
+        except ValueError:
+            return None, "Schwellwert muss eine Zahl sein"
+        
+        left_part = filter_string[:match.start()].strip()
+        elements = cls._extract_elements(left_part)
+        
+        if not elements:
+            return None, f"Keine Elemente in '{left_part}'"
+        
+        unknown = [e for e in elements if e not in cls.VALID_ELEMENTS]
+        if unknown:
+            return None, f"Unbekannte Elemente: {', '.join(unknown)}"
+        
+        def evaluate(element_dict):
+            summe = sum(element_dict.get(elem, 0) for elem in elements)
+            if operator == '>':
+                return summe > threshold
+            elif operator == '>=':
+                return summe >= threshold
+            elif operator == '<':
+                return summe < threshold
+            elif operator == '<=':
+                return summe <= threshold
+            elif operator == '==':
+                return abs(summe - threshold) < 0.01
+            elif operator == '!=':
+                return abs(summe - threshold) >= 0.01
+            return False
+        
+        return evaluate, None
+    
+    @classmethod
+    def _extract_elements(cls, expression):
+        """Extrahiert Elementnamen aus 'C+O' oder '(Fe+Ni)'"""
+        expression = expression.replace('(', '').replace(')', '')
+        parts = re.split(r'[+\-]', expression)
+        elements = []
+        for part in parts:
+            part = part.strip()
+            if part and part.isalpha() and len(part) <= 2:
+                formatted = part[0].upper() + part[1:].lower() if len(part) > 1 else part.upper()
+                if formatted in cls.VALID_ELEMENTS:
+                    elements.append(formatted)
+        return elements
+    
+    @classmethod
+    def validiere(cls, filter_string):
+        """Nur validieren, returns: (ist_gueltig, nachricht)"""
+        func, error = cls.parse(filter_string)
+        if error:
+            return False, error
+        return True, "✓ Filter ist gültig"
+
 # --- KONFIGURATION ---
 BASIS_PFAD = r"C:\Users\aaron\Nextcloud\Documents\work\H2Lab_Evaluation_System"
 MUL_TURKIS = "#008c96"
@@ -266,7 +351,11 @@ SEM_FILTER_ELEMENTE = (
 )
 SEM_FILTER_OPERATOREN = ("<", "<=", ">", ">=")
 # Ein Default-Filter, analog zum in der Aufgabenstellung genannten Beispiel "C < 30".
-SEM_FILTER_STANDARD_LISTE = [{"element": "C", "operator": "<", "wert": 30.0, "aktiv": True}]
+# "elemente" ist eine LISTE (nicht nur ein einzelnes Element) - ist mehr als
+# ein Element eingetragen, werden deren Anteile aufsummiert, bevor mit
+# "operator"/"wert" verglichen wird (z.B. "elemente": ["C", "O"], ">", 15
+# => Filter "C+O > 15 %").
+SEM_FILTER_STANDARD_LISTE = [{"elemente": ["C"], "operator": "<", "wert": 30.0, "aktiv": True}]
 
 # Default-Farbpalette fuer die Element-Faerbung im Ergebnisse-Tab (siehe
 # baue_ergebnisse_tab_sem) - wird der Reihe nach an neu auftauchende Elemente
@@ -2706,12 +2795,37 @@ class LaborApp(ctk.CTk):
             normiert[element] = werte
         return normiert
 
+    def _sem_normalisiere_filter_liste(self, filter_liste):
+        """
+        Wandelt evtl. noch im ALTEN Format ("element": "C") gespeicherte
+        Filter in das neue Format ("elemente": ["C", ...]) um, damit auch
+        aeltere gespeicherte Rohdaten-Filter-Einstellungen weiter funktionieren.
+        """
+        normalisiert = []
+        for eintrag in filter_liste or []:
+            elemente = eintrag.get("elemente")
+            if not elemente:
+                einzel = eintrag.get("element")
+                elemente = [einzel] if einzel else ["C"]
+            normalisiert.append({
+                "elemente": list(elemente),
+                "operator": eintrag.get("operator", "<"),
+                "wert": eintrag.get("wert", 0),
+                "aktiv": eintrag.get("aktiv", True),
+            })
+        return normalisiert
+
     def _sem_wende_filter_an(self, karten, filter_liste):
         """
         Wendet die (aktiven) Schwellwert-Filter der Filter-Sektion nacheinander
         per UND auf die Elementkarten an (z.B. "C < 30" AND "O > 5" ...) und
         liefert die finale boolesche Maske zurueck. Analog zur in
         SEM/FILTERING_EXPLANATION.md beschriebenen Logik.
+
+        Ein Filter kann sich auf MEHRERE Elemente gleichzeitig beziehen
+        (eintrag["elemente"] = ["C", "O"]) - deren Anteile werden dann pro
+        Pixel aufsummiert, bevor mit operator/wert verglichen wird (Beispiel
+        "C+O > 15" -> ueberall wo C-Anteil + O-Anteil > 15 % ist).
         """
         import numpy as np
 
@@ -2719,26 +2833,26 @@ class LaborApp(ctk.CTk):
             return None
         form = next(iter(karten.values())).shape
         maske = np.ones(form, dtype=bool)
-        for eintrag in filter_liste:
+        for eintrag in self._sem_normalisiere_filter_liste(filter_liste):
             if not eintrag.get("aktiv", True):
                 continue
-            element = eintrag.get("element")
-            karte = karten.get(element)
-            if karte is None:
+            elemente = [e for e in eintrag.get("elemente", []) if e in karten]
+            if not elemente:
                 continue
+            summenkarte = np.sum(np.stack([karten[e] for e in elemente], axis=0), axis=0)
             operator = eintrag.get("operator", "<")
             try:
                 wert = float(eintrag.get("wert", 0))
             except (TypeError, ValueError):
                 continue
             if operator == "<":
-                vergleich = karte < wert
+                vergleich = summenkarte < wert
             elif operator == "<=":
-                vergleich = karte <= wert
+                vergleich = summenkarte <= wert
             elif operator == ">":
-                vergleich = karte > wert
+                vergleich = summenkarte > wert
             elif operator == ">=":
-                vergleich = karte >= wert
+                vergleich = summenkarte >= wert
             else:
                 continue
             maske &= vergleich
@@ -2761,12 +2875,101 @@ class LaborApp(ctk.CTk):
         labels, anzahl = ndimage.label(maske)
         return labels, anzahl
 
-    def zeichne_rohdaten_vorschau_sem(self, voller_pfad, fig, achsen, canvas, zustand):
+    def _sem_aktualisiere_massstabsbalken(self, ax, um_pro_px):
+        """
+        Zeichnet/aktualisiert den Maßstabsbalken in `ax` DYNAMISCH basierend
+        auf dem AKTUELL SICHTBAREN Ausschnitt (ax.get_xlim()/get_ylim()) -
+        dadurch passt sich die Beschriftung automatisch an, wenn per
+        Strg+Mausrad/Lupe/Verschieben gezoomt bzw. gepannt wird (z.B. "50 µm"
+        in der Vollansicht -> "5 µm" stark reingezoomt). `um_pro_px` ist die
+        Kalibrierung Mikrometer/Pixel (vom Nutzer editierbar im Rohdaten-Tab).
+        Bei um_pro_px <= 0 wird nur der vorherige Balken entfernt.
+
+        Vorherige Balken-Elemente (Linie + Text) werden VOR dem Neuzeichnen
+        entfernt (in ax._sem_massstab_artists zwischengespeichert) - sonst
+        wuerden sich bei jedem Zoom/Pan-Schritt immer mehr Balken uebereinander
+        stapeln.
+        """
+        import math
+
+        for artist in getattr(ax, "_sem_massstab_artists", []):
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        ax._sem_massstab_artists = []
+
+        if not um_pro_px or um_pro_px <= 0:
+            return
+
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        sichtbare_breite_px = abs(xlim[1] - xlim[0])
+        sichtbare_hoehe_px = abs(ylim[1] - ylim[0])
+        if sichtbare_breite_px <= 0:
+            return
+
+        ziel_breite_um = sichtbare_breite_px * um_pro_px * 0.2
+        if ziel_breite_um <= 0:
+            return
+        exponent = math.floor(math.log10(ziel_breite_um))
+        balken_um = 10 ** (exponent + 1)
+        for basis in (1, 2, 5, 10):
+            kandidat = basis * (10 ** exponent)
+            if kandidat >= ziel_breite_um:
+                balken_um = kandidat
+                break
+        balken_px = balken_um / um_pro_px
+
+        x_min = min(xlim)
+        rand_x = x_min + sichtbare_breite_px * 0.05
+        rand_y = sichtbare_hoehe_px * 0.08
+        # Bei imshow ist die y-Achse i.d.R. invertiert (0 oben, Bildhoehe
+        # unten) - "unten im Bild" liegt dann bei max(ylim), sonst bei
+        # min(ylim). Balken + Beschriftung entsprechend dazu ausrichten.
+        invertiert = ylim[0] > ylim[1]
+        if invertiert:
+            y_balken = max(ylim) - rand_y
+            text_y = y_balken - sichtbare_hoehe_px * 0.025
+            va = "bottom"
+        else:
+            y_balken = min(ylim) + rand_y
+            text_y = y_balken + sichtbare_hoehe_px * 0.025
+            va = "top"
+
+        linie, = ax.plot(
+            [rand_x, rand_x + balken_px], [y_balken, y_balken],
+            color="white", linewidth=3, solid_capstyle="butt", zorder=5,
+        )
+        beschriftung = f"{balken_um:g} µm"
+        text = ax.text(
+            rand_x + balken_px / 2, text_y, beschriftung,
+            color="white", fontsize=9, fontweight="bold", ha="center", va=va, zorder=5,
+            path_effects=self._sem_massstab_texteffekt(),
+        )
+        ax._sem_massstab_artists = [linie, text]
+
+    def _sem_massstab_texteffekt(self):
+        # Duenne schwarze Kontur um die weisse Maßstabs-Beschriftung, damit
+        # sie auch auf hellem Bildhintergrund lesbar bleibt.
+        try:
+            import matplotlib.patheffects as pe
+            return [pe.withStroke(linewidth=2, foreground="black")]
+        except ImportError:
+            return []
+
+    def zeichne_rohdaten_vorschau_sem(self, voller_pfad, fig, achsen, canvas, zustand, aktuelle_daten=None):
         """
         Zeichnet die 2 Diagramme des SEM-Rohdaten-Tabs neu: links das
         Ausgangsbild, rechts das gefilterte Bild inkl. Cluster-Umrissen
         (falls aktiviert). `zustand` enthaelt die Filter-Sektion
-        (zustand["filter"]), sowie "normieren" und "cluster_anzeigen".
+        (zustand["filter"]), sowie "normieren", "cluster_anzeigen" und
+        "mikrometer_pro_pixel" (fuer den Maßstabsbalken).
+
+        `aktuelle_daten` (optional): Dict, in dem die auf Prozent normierten
+        Elementkarten zwischengespeichert werden (aktuelle_daten["karten_normiert"]),
+        damit ein Klick auf ein Pixel (siehe baue_rohdaten_tab_sem) die
+        Elementzusammensetzung an genau dieser Stelle nachschlagen kann, ohne
+        die TIFs ein weiteres Mal von der Platte zu lesen.
         """
         import numpy as np
 
@@ -2790,13 +2993,22 @@ class LaborApp(ctk.CTk):
 
         ax_rechts.set_title("Gefiltert" + (" + Cluster-Umrisse" if zustand.get("cluster_anzeigen", True) else ""))
         if not elementkarten:
+            if aktuelle_daten is not None:
+                aktuelle_daten["karten_normiert"] = None
             ax_rechts.text(0.5, 0.5, "Keine Elementkarten (TIF) gefunden", ha="center", va="center")
             ax_rechts.set_xticks([])
             ax_rechts.set_yticks([])
             canvas.draw()
             return
 
-        karten = self._sem_normalisiere_elementkarten(elementkarten) if zustand.get("normieren", True) else elementkarten
+        karten_prozent = self._sem_normalisiere_elementkarten(elementkarten)
+        if aktuelle_daten is not None:
+            # IMMER die %-normierten Karten fuer den Pixel-Klick-Popup
+            # zwischenspeichern (unabhaengig vom "normieren"-Haekchen, das
+            # nur die Filter-Anzeige betrifft) - die Zusammensetzung an
+            # einem Pixel will man ja immer in % sehen.
+            aktuelle_daten["karten_normiert"] = karten_prozent
+        karten = karten_prozent if zustand.get("normieren", True) else elementkarten
         maske = self._sem_wende_filter_an(karten, zustand.get("filter", []))
 
         if ausgangsbild is not None and ist_farbig:
@@ -2830,6 +3042,15 @@ class LaborApp(ctk.CTk):
         ax_rechts.set_xticks([])
         ax_rechts.set_yticks([])
 
+        um_pro_px = zustand.get("mikrometer_pro_pixel", 0.0)
+        for ax_massstab in (ax_links, ax_rechts):
+            # Vollansicht (Grenzen direkt nach dem Neuzeichnen, bevor
+            # irgendein Pan/Zoom passiert ist) fuer den Doppelklick-Reset
+            # merken (siehe _on_press/_vollansicht_setzen in
+            # baue_rohdaten_tab_sem).
+            ax_massstab._sem_vollansicht = (ax_massstab.get_xlim(), ax_massstab.get_ylim())
+            self._sem_aktualisiere_massstabsbalken(ax_massstab, um_pro_px)
+
         fig.tight_layout()
         canvas.draw()
 
@@ -2851,7 +3072,10 @@ class LaborApp(ctk.CTk):
 
         try:
             import matplotlib.pyplot as plt
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            import matplotlib.patches as mpatches
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+            import tkinter as tk
+            import numpy as np
         except ImportError:
             ctk.CTkLabel(
                 parent,
@@ -2864,12 +3088,14 @@ class LaborApp(ctk.CTk):
             "filter": [dict(f) for f in SEM_FILTER_STANDARD_LISTE],
             "normieren": True,
             "cluster_anzeigen": True,
+            "mikrometer_pro_pixel": 1.0,
         }
         zustand = self.lade_rohdaten_filter_einstellungen_fuer_versuch(
             projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, versuche[0][2]), zustand_standard
         )
         if not zustand.get("filter"):
             zustand["filter"] = [dict(f) for f in SEM_FILTER_STANDARD_LISTE]
+        zustand["filter"] = self._sem_normalisiere_filter_liste(zustand["filter"])
 
         haupt_layout = ctk.CTkFrame(parent, fg_color="transparent")
         haupt_layout.pack(fill="both", expand=True, padx=10, pady=10)
@@ -2919,6 +3145,8 @@ class LaborApp(ctk.CTk):
             )
             if not zustand.get("filter"):
                 zustand["filter"] = [dict(f) for f in SEM_FILTER_STANDARD_LISTE]
+            zustand["filter"] = self._sem_normalisiere_filter_liste(zustand["filter"])
+            markierungen.clear()
             if aktualisiere_filter_panel["fn"]:
                 aktualisiere_filter_panel["fn"]()
             zeichne()
@@ -2936,17 +3164,296 @@ class LaborApp(ctk.CTk):
         mitte = ctk.CTkFrame(haupt_layout, fg_color="transparent")
         mitte.pack(side="left", fill="both", expand=True, padx=(0, 0))
 
+        # Toolbar (Home/Zurueck/Vor/Pan/Zoom) UNTER den Diagrammen, damit man
+        # ein versehentlich mit der Maus verschobenes Bild ueber den
+        # "Home"-Knopf wieder schoen in die Mitte/Vollansicht zurueckholen
+        # kann - analog zur Ergebnisse-Tab-Toolbar. NavigationToolbar2Tk
+        # braucht ein "echtes" Tk-Widget als Master, daher tk.Frame statt
+        # CTkFrame fuer den Toolbar-Container.
+        toolbar_frame = tk.Frame(mitte)
+        toolbar_frame.pack(side="bottom", fill="x")
+
         figsize = self._dynamische_figsize(mitte, 2, 1, mindest_breite_px=650, mindest_hoehe_px=420)
         fig, achsen_zeile = plt.subplots(1, 2, figsize=figsize)
         achsen = (achsen_zeile[0], achsen_zeile[1])
         canvas = FigureCanvasTkAgg(fig, master=mitte)
-        canvas.get_tk_widget().pack(fill="both", expand=True)
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+
+        aktuelle_daten = {"karten_normiert": None}
+        markierungen = []
 
         def zeichne():
             pfad = ausgewaehlter_pfad["wert"]
             if not pfad:
                 return
-            self.zeichne_rohdaten_vorschau_sem(pfad, fig, achsen, canvas, zustand)
+            self.zeichne_rohdaten_vorschau_sem(pfad, fig, achsen, canvas, zustand, aktuelle_daten=aktuelle_daten)
+            _zeichne_markierungen()
+            canvas.draw()
+
+        # --- Strg + Mausrad: beide Diagramme SYNCHRON zoomen (um den
+        # Cursor herum), damit man Ausgangsbild und gefiltertes Bild
+        # gemeinsam vergleichend reinzoomen kann. Ohne gedrueckte Strg-Taste
+        # passiert nichts, damit normales Scrollen der Seite nicht gestoert wird. ---
+        def _strg_gedrueckt(event):
+            gui_event = getattr(event, "guiEvent", None)
+            zustand_bits = getattr(gui_event, "state", 0)
+            try:
+                return bool(int(zustand_bits) & 0x0004)
+            except (TypeError, ValueError):
+                return False
+
+        def _synchroner_zoom(event):
+            ziel_achse = event.inaxes
+            if ziel_achse not in achsen or not _strg_gedrueckt(event):
+                return
+            if event.button == "up":
+                faktor = 0.85
+            elif event.button == "down":
+                faktor = 1.0 / 0.85
+            else:
+                return
+            xlim0, ylim0 = ziel_achse.get_xlim(), ziel_achse.get_ylim()
+            breite0, hoehe0 = xlim0[1] - xlim0[0], ylim0[1] - ylim0[0]
+            rel_x = (event.xdata - xlim0[0]) / breite0 if breite0 else 0.5
+            rel_y = (event.ydata - ylim0[0]) / hoehe0 if hoehe0 else 0.5
+            for achse in achsen:
+                xlim, ylim = achse.get_xlim(), achse.get_ylim()
+                neue_breite = (xlim[1] - xlim[0]) * faktor
+                neue_hoehe = (ylim[1] - ylim[0]) * faktor
+                mitte_x = xlim[0] + rel_x * (xlim[1] - xlim[0])
+                mitte_y = ylim[0] + rel_y * (ylim[1] - ylim[0])
+                achse.set_xlim(mitte_x - rel_x * neue_breite, mitte_x + (1 - rel_x) * neue_breite)
+                achse.set_ylim(mitte_y - rel_y * neue_hoehe, mitte_y + (1 - rel_y) * neue_hoehe)
+            canvas.draw_idle()
+
+        canvas.mpl_connect("scroll_event", _synchroner_zoom)
+
+        def _werte_am_pixel(x, y):
+            karten = aktuelle_daten["karten_normiert"]
+            if not karten:
+                return None
+            beispiel = next(iter(karten.values()))
+            if not (0 <= y < beispiel.shape[0] and 0 <= x < beispiel.shape[1]):
+                return None
+            return {element: float(karte[y, x]) for element, karte in karten.items()}
+
+        def _durchschnitt_im_bereich(x0, y0, x1, y1):
+            """Mittelwert jedes Elements ueber ein rechteckiges Pixel-Gebiet
+            (fuer die Rechteck-Auswahl per Ziehen). Koordinaten werden
+            automatisch auf die Bildgrenzen begrenzt."""
+            karten = aktuelle_daten["karten_normiert"]
+            if not karten:
+                return None
+            beispiel = next(iter(karten.values()))
+            hoehe_bild, breite_bild = beispiel.shape[0], beispiel.shape[1]
+            xa, xb = sorted((int(round(x0)), int(round(x1))))
+            ya, yb = sorted((int(round(y0)), int(round(y1))))
+            xa = max(0, min(xa, breite_bild - 1))
+            xb = max(0, min(xb, breite_bild - 1))
+            ya = max(0, min(ya, hoehe_bild - 1))
+            yb = max(0, min(yb, hoehe_bild - 1))
+            if xb < xa or yb < ya:
+                return None
+            return (
+                {element: float(np.mean(karte[ya:yb + 1, xa:xb + 1])) for element, karte in karten.items()},
+                (xa, ya, xb, yb),
+            )
+
+        def _markierung_box_inhalt(marker, index):
+            """Zeilen + grobe Box-Groesse (in Punkten) fuer die
+            Zusammensetzungs-Box einer Markierung - wird sowohl beim
+            Zeichnen (Position der Box/des "x"-Knopfes) als auch beim
+            Klick-Hittest auf den "x"-Knopf gebraucht, damit beide exakt
+            dieselbe Geometrie annehmen."""
+            top_werte = sorted(marker["werte"].items(), key=lambda kv: -kv[1])[:5]
+            zeilen = [f"{element}: {wert:.1f}%" for element, wert in top_werte if wert > 0.0]
+            if marker.get("typ") == "rechteck":
+                kopf = f"Ø{index}  ({marker['breite']}×{marker['hoehe']} px)"
+            else:
+                kopf = f"M{index}"
+            alle_zeilen = [kopf] + (zeilen if zeilen else ["keine Elemente > 0 %"])
+            breite_pts = 16 + max(len(z) for z in alle_zeilen) * 5.5
+            hoehe_pts = 14 + len(alle_zeilen) * 12.5
+            return zeilen, breite_pts, hoehe_pts
+
+        def _x_knopf_offset_pts(marker, index):
+            _zeilen, breite_pts, hoehe_pts = _markierung_box_inhalt(marker, index)
+            return (16 + breite_pts - 10, 16 + hoehe_pts - 8)
+
+        def _x_knopf_display_pos(marker, index):
+            """Aktuelle Bildschirm-Position (Pixel) des Mini-'x'-Knopfes
+            EINER Markierung - IMMER frisch aus dem aktuellen Zoom/Pan-
+            Zustand berechnet (ax.transData), damit der Hittest auch nach
+            Verschieben/Zoomen ohne Neuzeichnen noch stimmt."""
+            off_x_pts, off_y_pts = _x_knopf_offset_pts(marker, index)
+            anker_disp = marker["ax"].transData.transform((marker["x"], marker["y"]))
+            px_je_pt = fig.dpi / 72.0
+            return (anker_disp[0] + off_x_pts * px_je_pt, anker_disp[1] + off_y_pts * px_je_pt)
+
+        def _klick_auf_x_knopf(event):
+            for index, marker in enumerate(markierungen, start=1):
+                if marker["ax"] is not event.inaxes:
+                    continue
+                bx, by = _x_knopf_display_pos(marker, index)
+                if (event.x - bx) ** 2 + (event.y - by) ** 2 <= 11 ** 2:
+                    return marker
+            return None
+
+        def _zeichne_markierungen():
+            """Zeichnet fuer jede gesetzte Markierung entweder einen kleinen
+            nummerierten Kreis am Pixel (einzelner Klick) oder ein
+            gestricheltes Rechteck (Rechteck-Auswahl per Ziehen), jeweils
+            mit einer Box mit der (Durchschnitts-)Elementzusammensetzung
+            DIREKT DANEBEN im jeweiligen Bild - inkl. Mini-"x"-Knopf oben
+            rechts zum gezielten Entfernen genau dieser einen Markierung."""
+            for index, marker in enumerate(markierungen, start=1):
+                ax_ziel = marker["ax"]
+                if marker.get("typ") == "rechteck":
+                    rect_patch = mpatches.Rectangle(
+                        (marker["x0"], marker["y0"]),
+                        marker["x1"] - marker["x0"], marker["y1"] - marker["y0"],
+                        fill=False, edgecolor="white", linewidth=1.6, linestyle="--", zorder=5,
+                    )
+                    ax_ziel.add_patch(rect_patch)
+                    ax_ziel.annotate(
+                        str(index), (marker["x0"], marker["y0"]), color="white", fontsize=9, fontweight="bold",
+                        xytext=(3, -3), textcoords="offset points", ha="left", va="top",
+                    )
+                else:
+                    ax_ziel.plot(marker["x"], marker["y"], marker="o", markersize=9,
+                                 markerfacecolor="none", markeredgecolor="white", markeredgewidth=2)
+                    ax_ziel.annotate(
+                        str(index), (marker["x"], marker["y"]), color="white", fontsize=9, fontweight="bold",
+                        ha="center", va="center",
+                    )
+                zeilen, _breite_pts, _hoehe_pts = _markierung_box_inhalt(marker, index)
+                kopf = f"Ø{index}" if marker.get("typ") == "rechteck" else f"M{index}"
+                box_text = kopf + "\n" + ("\n".join(zeilen) if zeilen else "keine Elemente > 0 %")
+                ax_ziel.annotate(
+                    box_text,
+                    xy=(marker["x"], marker["y"]), xycoords="data",
+                    xytext=(16, 16), textcoords="offset points",
+                    fontsize=8, color="black", ha="left", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.35", fc="white", ec=MUL_TURKIS, alpha=0.92),
+                    arrowprops=dict(arrowstyle="->", color=MUL_TURKIS, lw=1.2),
+                    zorder=6,
+                )
+                x_knopf_offset = _x_knopf_offset_pts(marker, index)
+                ax_ziel.annotate(
+                    "✕",
+                    xy=(marker["x"], marker["y"]), xycoords="data",
+                    xytext=x_knopf_offset, textcoords="offset points",
+                    fontsize=8, color="white", fontweight="bold", ha="center", va="center",
+                    bbox=dict(boxstyle="circle,pad=0.22", fc="#c0392b", ec="white", lw=1),
+                    zorder=7,
+                )
+
+        # --- Klick = einzelner Pixel, Ziehen (Rechteck aufziehen) =
+        # Durchschnitts-Elementaranalyse ueber die Auswahl. Unterschieden
+        # wird per Maus-runter/-bewegt/-los statt nur einem einzelnen
+        # Klick-Event, damit ein kurzer Klick weiterhin wie bisher einen
+        # Punkt setzt, ein Ziehen aber die neue Rechteck-Auswahl ausloest. ---
+        auswahl = {"aktiv": False, "achse": None, "start_data": None, "start_disp": None, "vorschau": None}
+        ZIEH_SCHWELLE_PX = 6  # Mindestbewegung in Bildschirm-Pixeln fuer "Ziehen" statt "Klick"
+
+        def _auswahl_vorschau_entfernen():
+            if auswahl["vorschau"] is not None:
+                try:
+                    auswahl["vorschau"].remove()
+                except Exception:
+                    pass
+                auswahl["vorschau"] = None
+
+        def _maus_runter(event):
+            if event.button != 1:
+                return
+            # Waehrend die Toolbar-Lupe/Pan aktiv ist, gehoert der Klick/Zug
+            # zum Zoomen/Verschieben - dann KEINE Markierung setzen/entfernen.
+            if getattr(toolbar, "mode", ""):
+                return
+            # Klick auf den Mini-"x"-Knopf einer bestehenden Box? Das MUSS
+            # VOR dem inaxes-Check passieren: die Box (und damit der
+            # "x"-Knopf) kann ueber den Bildrand hinaus in den Bereich
+            # AUSSERHALB der Achsen hineinragen.
+            treffer = _klick_auf_x_knopf(event)
+            if treffer is not None:
+                markierungen.remove(treffer)
+                zeichne()
+                return
+            if event.inaxes not in achsen or event.xdata is None or event.ydata is None:
+                return
+            canvas.get_tk_widget().focus_set()
+            auswahl["aktiv"] = True
+            auswahl["achse"] = event.inaxes
+            auswahl["start_data"] = (event.xdata, event.ydata)
+            auswahl["start_disp"] = (event.x, event.y)
+
+        def _maus_bewegt(event):
+            if not auswahl["aktiv"] or event.inaxes != auswahl["achse"] or event.xdata is None or event.ydata is None:
+                return
+            x0, y0 = auswahl["start_data"]
+            _auswahl_vorschau_entfernen()
+            patch = mpatches.Rectangle(
+                (min(x0, event.xdata), min(y0, event.ydata)),
+                abs(event.xdata - x0), abs(event.ydata - y0),
+                fill=False, edgecolor="white", linewidth=1.2, linestyle="--", zorder=8,
+            )
+            auswahl["achse"].add_patch(patch)
+            auswahl["vorschau"] = patch
+            canvas.draw_idle()
+
+        def _maus_los(event):
+            if not auswahl["aktiv"]:
+                return
+            auswahl["aktiv"] = False
+            _auswahl_vorschau_entfernen()
+            achse = auswahl["achse"]
+            start_disp = auswahl["start_disp"]
+            start_data = auswahl["start_data"]
+            if event.inaxes != achse or event.xdata is None or event.ydata is None:
+                canvas.draw_idle()
+                return
+            bewegt_px = ((event.x - start_disp[0]) ** 2 + (event.y - start_disp[1]) ** 2) ** 0.5
+            if bewegt_px < ZIEH_SCHWELLE_PX:
+                # Kurzer Klick (kaum Bewegung) -> wie bisher ein einzelner Punkt.
+                x = int(round(event.xdata))
+                y = int(round(event.ydata))
+                werte = _werte_am_pixel(x, y)
+                if werte is None:
+                    canvas.draw_idle()
+                    return
+                markierungen.append({"typ": "punkt", "ax": achse, "x": x, "y": y, "werte": werte})
+            else:
+                # Rechteck aufgezogen -> Durchschnitts-Elementaranalyse ueber
+                # die Auswahl. Box wird an der oberen rechten Ecke verankert.
+                ergebnis = _durchschnitt_im_bereich(start_data[0], start_data[1], event.xdata, event.ydata)
+                if ergebnis is None:
+                    canvas.draw_idle()
+                    return
+                werte, (xa, ya, xb, yb) = ergebnis
+                markierungen.append({
+                    "typ": "rechteck", "ax": achse,
+                    "x": xb, "y": ya,
+                    "x0": xa, "y0": ya, "x1": xb, "y1": yb,
+                    "breite": max(xb - xa + 1, 1), "hoehe": max(yb - ya + 1, 1),
+                    "werte": werte,
+                })
+            zeichne()
+
+        def _bei_taste(event):
+            # ESC schliesst die zuletzt gesetzte Markierung (zusaetzlich zum
+            # Mini-"x"-Knopf direkt an der Box).
+            if event.key == "escape" and markierungen:
+                markierungen.pop()
+                zeichne()
+
+        canvas.mpl_connect("button_press_event", _maus_runter)
+        canvas.mpl_connect("motion_notify_event", _maus_bewegt)
+        canvas.mpl_connect("button_release_event", _maus_los)
+        canvas.mpl_connect("key_press_event", _bei_taste)
 
         # --- Rechts: Filter-Sektion (dynamische Liste) + Normierung/Cluster ---
         rechte_breite_merker = {"breite": 340}
@@ -2973,7 +3480,8 @@ class LaborApp(ctk.CTk):
         ctk.CTkLabel(
             rechte_spalte,
             text="Schwellwert-Filter auf normierte Elementanteile, z.B. C < 30. "
-                 "Werden per UND kombiniert (alle aktiven Filter muessen zutreffen).",
+                 "Mehrere Elemente pro Zeile ergeben eine SUMME, z.B. C+O > 15. "
+                 "Zeilen werden per UND kombiniert (alle aktiven Filter muessen zutreffen).",
             font=("Arial", 10), text_color=("gray30", "gray70"),
             anchor="w", justify="left", wraplength=290,
         ).pack(fill="x", padx=10, pady=(0, 10))
@@ -2998,7 +3506,7 @@ class LaborApp(ctk.CTk):
                 except ValueError:
                     wert = eintrag["daten"].get("wert", 0)
                 neue_liste.append({
-                    "element": eintrag["element_dropdown"].get(),
+                    "elemente": list(eintrag["elemente_liste"]) or ["C"],
                     "operator": eintrag["operator_dropdown"].get(),
                     "wert": wert,
                     "aktiv": bool(eintrag["aktiv_var"].get()),
@@ -3016,26 +3524,23 @@ class LaborApp(ctk.CTk):
                 zeile = ctk.CTkFrame(filter_liste_frame, fg_color=("gray90", "gray20"))
                 zeile.pack(fill="x", padx=10, pady=4)
 
-                aktiv_var = ctk.BooleanVar(value=eintrag.get("aktiv", True))
-                ctk.CTkCheckBox(zeile, text="", variable=aktiv_var, width=20).pack(side="left", padx=(6, 2))
+                kopfzeile_filter = ctk.CTkFrame(zeile, fg_color="transparent")
+                kopfzeile_filter.pack(fill="x", padx=6, pady=(4, 2))
 
-                element_werte = list(SEM_FILTER_ELEMENTE)
-                if eintrag.get("element") not in element_werte:
-                    element_werte = [eintrag.get("element", "C")] + element_werte
-                element_dropdown = ctk.CTkOptionMenu(zeile, values=element_werte, width=70, fg_color=MUL_TURKIS)
-                element_dropdown.set(eintrag.get("element", "C"))
-                element_dropdown.pack(side="left", padx=2)
+                aktiv_var = ctk.BooleanVar(value=eintrag.get("aktiv", True))
+                ctk.CTkCheckBox(kopfzeile_filter, text="", variable=aktiv_var, width=20).pack(side="left", padx=(0, 2))
 
                 operator_dropdown = ctk.CTkOptionMenu(
-                    zeile, values=list(SEM_FILTER_OPERATOREN), width=55, fg_color=MUL_TURKIS
+                    kopfzeile_filter, values=list(SEM_FILTER_OPERATOREN), width=55, fg_color=MUL_TURKIS
                 )
                 operator_dropdown.set(eintrag.get("operator", "<"))
                 operator_dropdown.pack(side="left", padx=2)
 
-                wert_entry = ctk.CTkEntry(zeile, width=70)
+                wert_entry = ctk.CTkEntry(kopfzeile_filter, width=60)
                 wert_entry.insert(0, str(eintrag.get("wert", 0)))
                 wert_entry.pack(side="left", padx=2)
                 wert_entry.bind("<Return>", lambda _e: uebernehmen())
+                ctk.CTkLabel(kopfzeile_filter, text="%", font=("Arial", 11)).pack(side="left", padx=(0, 4))
 
                 def _entfernen(i=index):
                     _uebernimm_zeilen_in_zustand()
@@ -3044,19 +3549,75 @@ class LaborApp(ctk.CTk):
                     uebernehmen()
 
                 ctk.CTkButton(
-                    zeile, text="✕", width=28, fg_color="transparent",
+                    kopfzeile_filter, text="✕", width=28, fg_color="transparent",
                     hover_color="#aa3333", command=_entfernen,
-                ).pack(side="right", padx=(2, 6))
+                ).pack(side="right", padx=(2, 0))
+
+                # --- Element-"Chips": ein Filter kann sich auf MEHRERE
+                # Elemente gleichzeitig beziehen (Summe), z.B. C + O. ---
+                elemente_liste = list(eintrag.get("elemente") or [eintrag.get("element", "C")])
+                if not elemente_liste:
+                    elemente_liste = ["C"]
+
+                chips_zeile = ctk.CTkFrame(zeile, fg_color="transparent")
+                chips_zeile.pack(fill="x", padx=6, pady=(0, 6))
+
+                def _chips_neu_zeichnen(chips_zeile=chips_zeile, elemente_liste=elemente_liste):
+                    for kind in chips_zeile.winfo_children():
+                        kind.destroy()
+                    for i, elem in enumerate(elemente_liste):
+                        if i > 0:
+                            ctk.CTkLabel(chips_zeile, text="+", font=("Arial", 11, "bold")).pack(side="left", padx=(2, 2))
+                        chip = ctk.CTkFrame(chips_zeile, fg_color=MUL_TURKIS, corner_radius=5)
+                        chip.pack(side="left", padx=1)
+                        ctk.CTkLabel(chip, text=elem, text_color="white", font=("Arial", 11, "bold")).pack(
+                            side="left", padx=(6, 2), pady=2
+                        )
+
+                        def _element_entfernen(i=i, chips_zeile=chips_zeile, elemente_liste=elemente_liste):
+                            if len(elemente_liste) > 1:
+                                elemente_liste.pop(i)
+                                _chips_neu_zeichnen(chips_zeile, elemente_liste)
+                                uebernehmen()
+
+                        ctk.CTkButton(
+                            chip, text="✕", width=16, height=16, fg_color="transparent",
+                            text_color="white", hover_color="#aa3333", font=("Arial", 9),
+                            command=_element_entfernen,
+                        ).pack(side="left", padx=(0, 4), pady=2)
+
+                    verbleibend = [e for e in SEM_FILTER_ELEMENTE if e not in elemente_liste]
+                    hinzufuegen_dropdown = ctk.CTkOptionMenu(
+                        chips_zeile, values=verbleibend or ["–"], width=90,
+                        # WICHTIG: CTkOptionMenu erlaubt hier (anders als
+                        # CTkButton) KEIN fg_color="transparent" - das
+                        # crasht mit "ValueError: transparency is not
+                        # allowed for this attribute". Stattdessen ein
+                        # neutraler Grauton passend zur uebrigen Filter-UI.
+                        fg_color=("gray80", "gray25"), button_color=MUL_TURKIS,
+                    )
+                    hinzufuegen_dropdown.set("+ Element")
+
+                    def _element_hinzufuegen(gewaehlt, chips_zeile=chips_zeile, elemente_liste=elemente_liste):
+                        if gewaehlt and gewaehlt != "–" and gewaehlt not in elemente_liste:
+                            elemente_liste.append(gewaehlt)
+                            _chips_neu_zeichnen(chips_zeile, elemente_liste)
+                            uebernehmen()
+
+                    hinzufuegen_dropdown.configure(command=_element_hinzufuegen)
+                    hinzufuegen_dropdown.pack(side="left", padx=(4, 0))
+
+                _chips_neu_zeichnen()
 
                 filter_zeilen_widgets.append({
                     "daten": eintrag, "aktiv_var": aktiv_var,
-                    "element_dropdown": element_dropdown, "operator_dropdown": operator_dropdown,
+                    "elemente_liste": elemente_liste, "operator_dropdown": operator_dropdown,
                     "wert_entry": wert_entry,
                 })
 
         def _filter_hinzufuegen():
             _uebernimm_zeilen_in_zustand()
-            zustand["filter"].append({"element": "O", "operator": ">", "wert": 5.0, "aktiv": True})
+            zustand["filter"].append({"elemente": ["O"], "operator": ">", "wert": 5.0, "aktiv": True})
             baue_filter_zeilen()
 
         ctk.CTkButton(
@@ -3996,6 +4557,21 @@ class LaborApp(ctk.CTk):
             hex_wert = "ffffff"
         return tuple(int(hex_wert[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
 
+    def _sem_sichere_hex_farbe(self, wert, fallback="#ffffff"):
+        """
+        Liefert IMMER einen gueltigen Hex-Farbstring ("#rrggbb") zurueck.
+        Faengt insbesondere "transparent" ab (das z.B. bei CTkButton fuer
+        hover_color/border_color NICHT erlaubt ist und sonst mit
+        "ValueError: transparency is not allowed for this attribute"
+        abstuerzt) sowie None/leere/kaputte Werte, z.B. aus einer aelteren
+        gespeicherten diagramm_einstellungen.json.
+        """
+        if isinstance(wert, str):
+            kandidat = wert.strip()
+            if kandidat.startswith("#") and len(kandidat) in (4, 7):
+                return kandidat
+        return fallback
+
     def _sem_stelle_element_zustand_sicher(self, zustand, elemente):
         """
         Ergaenzt in zustand['element_farben']/['element_sichtbar'] fehlende
@@ -4068,8 +4644,10 @@ class LaborApp(ctk.CTk):
 
         try:
             import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
             import tkinter as tk
+            import numpy as np
         except ImportError:
             ctk.CTkLabel(
                 parent,
@@ -4080,6 +4658,10 @@ class LaborApp(ctk.CTk):
 
         zustand_standard = {"element_farben": {}, "element_sichtbar": {}, "mindestanteil": 0.0}
         zustand = self.lade_diagramm_einstellungen(projekt, methode, zustand_standard)
+        # Absichern gegen kaputte/veraltete gespeicherte Werte (z.B. "transparent"
+        # oder leere Strings) - siehe _sem_sichere_hex_farbe.
+        for _element, _farbe in list(zustand.get("element_farben", {}).items()):
+            zustand["element_farben"][_element] = self._sem_sichere_hex_farbe(_farbe)
 
         haupt_layout = ctk.CTkFrame(parent, fg_color="transparent")
         haupt_layout.pack(fill="both", expand=True, padx=10, pady=10)
@@ -4115,7 +4697,6 @@ class LaborApp(ctk.CTk):
         ausgewaehlter_pfad = {"wert": None}
         zeilen_frames = []
         aktualisiere_element_panel = {"fn": None}
-        aktualisiere_marker_panel = {"fn": None}
         # Normierte Elementkarten (Prozent je Pixel) des GERADE angezeigten
         # Versuchs - fuer den Maus-Hover-Readout (_bei_maus_bewegung) gecacht,
         # damit beim reinen Bewegen der Maus NICHT jedes Mal alle TIFs neu
@@ -4137,7 +4718,6 @@ class LaborApp(ctk.CTk):
         # Markierungs-Liste im rechten Panel). Jede Markierung merkt sich
         # Pixel-Koordinate + die Element-%-Werte an dieser Stelle.
         markierungen = []
-        marker_modus = {"aktiv": False}
 
         # --- Mitte: 1 grosses Overlay-Diagramm + Zoom-Werkzeugleiste +
         # Filter-Schieberegler + Marker-Werkzeug + Pixel-Werte-Anzeige (Hover) ---
@@ -4213,7 +4793,7 @@ class LaborApp(ctk.CTk):
 
         # --- Filter-Zeile: Mindestanteil-Schwelle (nur Pixel anzeigen, an
         # denen ein Element mindestens X % der lokalen Zusammensetzung
-        # ausmacht) + Marker-Werkzeug an/aus. ---
+        # ausmacht). ---
         filter_zeile = ctk.CTkFrame(untere_leiste, fg_color="transparent")
         filter_zeile.pack(side="bottom", fill="x", padx=8, pady=(2, 0))
 
@@ -4238,15 +4818,6 @@ class LaborApp(ctk.CTk):
             text="→ blendet Pixel aus, an denen ein Element weniger als diesen Anteil hat",
             font=("Arial", 10), text_color=("gray30", "gray70"),
         ).pack(side="left", padx=(0, 16))
-
-        marker_button = ctk.CTkButton(filter_zeile, text="📍 Marker setzen", width=140, fg_color="transparent", border_width=1)
-
-        def _marker_modus_umschalten():
-            marker_modus["aktiv"] = not marker_modus["aktiv"]
-            marker_button.configure(fg_color=MUL_TURKIS if marker_modus["aktiv"] else "transparent")
-
-        marker_button.configure(command=_marker_modus_umschalten)
-        marker_button.pack(side="right")
 
         # NavigationToolbar2Tk braucht ein "echtes" Tk-Widget als Master -
         # daher ein normales tk.Frame statt CTkFrame fuer den Toolbar-Container.
@@ -4290,32 +4861,207 @@ class LaborApp(ctk.CTk):
         def _bei_maus_verlassen(_event):
             _hover_zuruecksetzen()
 
-        def _bei_klick(event):
-            if not marker_modus["aktiv"] or event.inaxes != ax:
+        def _durchschnitt_im_bereich(x0, y0, x1, y1):
+            """Mittelwert jedes Elements ueber ein rechteckiges Pixel-Gebiet
+            (fuer die Rechteck-Auswahl per Ziehen). Koordinaten werden
+            automatisch auf die Bildgrenzen begrenzt."""
+            karten = aktuelle_daten["karten_normiert"]
+            if not karten:
+                return None
+            beispiel_karte = next(iter(karten.values()))
+            hoehe_bild, breite_bild = beispiel_karte.shape[0], beispiel_karte.shape[1]
+            xa, xb = sorted((int(round(x0)), int(round(x1))))
+            ya, yb = sorted((int(round(y0)), int(round(y1))))
+            xa = max(0, min(xa, breite_bild - 1))
+            xb = max(0, min(xb, breite_bild - 1))
+            ya = max(0, min(ya, hoehe_bild - 1))
+            yb = max(0, min(yb, hoehe_bild - 1))
+            if xb < xa or yb < ya:
+                return None
+            return (
+                {element: float(np.mean(karte[ya:yb + 1, xa:xb + 1])) for element, karte in karten.items()},
+                (xa, ya, xb, yb),
+            )
+
+        def _markierung_box_inhalt(marker, index):
+            """Zeilen + grobe Box-Groesse (in Punkten) fuer die
+            Zusammensetzungs-Box einer Markierung - wird sowohl beim
+            Zeichnen (Position der Box/des "x"-Knopfes) als auch beim
+            Klick-Hittest auf den "x"-Knopf gebraucht, damit beide exakt
+            dieselbe Geometrie annehmen."""
+            top_werte = sorted(marker["werte"].items(), key=lambda kv: -kv[1])[:5]
+            zeilen = [f"{element}: {wert:.1f}%" for element, wert in top_werte if wert >= 0.05]
+            if marker.get("typ") == "rechteck":
+                kopf = f"Ø{index}  ({marker['breite']}×{marker['hoehe']} px)"
+            else:
+                kopf = f"M{index}"
+            alle_zeilen = [kopf] + (zeilen if zeilen else ["alle Elemente ~0 %"])
+            breite_pts = 16 + max(len(z) for z in alle_zeilen) * 5.5
+            hoehe_pts = 14 + len(alle_zeilen) * 12.5
+            return zeilen, breite_pts, hoehe_pts
+
+        def _x_knopf_offset_pts(marker, index):
+            _zeilen, breite_pts, hoehe_pts = _markierung_box_inhalt(marker, index)
+            return (16 + breite_pts - 10, 16 + hoehe_pts - 8)
+
+        def _x_knopf_display_pos(marker, index):
+            """Aktuelle Bildschirm-Position (Pixel) des Mini-'x'-Knopfes
+            EINER Markierung - IMMER frisch aus dem aktuellen Zoom/Pan-
+            Zustand berechnet (ax.transData), damit der Hittest auch nach
+            Verschieben/Zoomen ohne Neuzeichnen noch stimmt."""
+            off_x_pts, off_y_pts = _x_knopf_offset_pts(marker, index)
+            anker_disp = ax.transData.transform((marker["x"], marker["y"]))
+            px_je_pt = fig.dpi / 72.0
+            return (anker_disp[0] + off_x_pts * px_je_pt, anker_disp[1] + off_y_pts * px_je_pt)
+
+        def _klick_auf_x_knopf(event):
+            for index, marker in enumerate(markierungen, start=1):
+                bx, by = _x_knopf_display_pos(marker, index)
+                if (event.x - bx) ** 2 + (event.y - by) ** 2 <= 11 ** 2:
+                    return marker
+            return None
+
+        # --- Klick = einzelner Pixel, Ziehen (Rechteck aufziehen) =
+        # Durchschnitts-Elementaranalyse ueber die Auswahl. Unterschieden
+        # wird per Maus-runter/-bewegt/-los statt nur einem einzelnen
+        # Klick-Event, damit ein kurzer Klick weiterhin wie bisher einen
+        # Punkt setzt, ein Ziehen aber die neue Rechteck-Auswahl ausloest. ---
+        auswahl = {"aktiv": False, "start_data": None, "start_disp": None, "vorschau": None}
+        ZIEH_SCHWELLE_PX = 6  # Mindestbewegung in Bildschirm-Pixeln fuer "Ziehen" statt "Klick"
+
+        def _auswahl_vorschau_entfernen():
+            if auswahl["vorschau"] is not None:
+                try:
+                    auswahl["vorschau"].remove()
+                except Exception:
+                    pass
+                auswahl["vorschau"] = None
+
+        def _maus_runter(event):
+            if event.button != 1:
                 return
-            if event.xdata is None or event.ydata is None:
-                return
-            # Waehrend die Toolbar-Lupe/Pan aktiv ist, gehoert ein Klick zum
-            # Zoomen/Verschieben - dann KEINEN Marker setzen (sonst laesst
-            # sich nicht mehr sauber zoomen, waehrend Marker-Modus an ist).
+            # Waehrend die Toolbar-Lupe/Pan aktiv ist, gehoert der Klick/Zug
+            # zum Zoomen/Verschieben - dann KEINE Markierung setzen/entfernen.
             if getattr(toolbar, "mode", ""):
                 return
-            x = int(round(event.xdata))
-            y = int(round(event.ydata))
-            werte = _werte_am_pixel(x, y)
-            if werte is None:
+            # Klick auf den Mini-"x"-Knopf einer bestehenden Box? Das MUSS
+            # VOR dem inaxes-Check passieren: die Box (und damit der
+            # "x"-Knopf) kann ueber den Bildrand hinaus in den Bereich
+            # AUSSERHALB der Achse hineinragen.
+            treffer = _klick_auf_x_knopf(event)
+            if treffer is not None:
+                markierungen.remove(treffer)
+                zeichne()
                 return
-            markierungen.append({
-                "x": x, "y": y,
-                "werte": {element: wert for element, wert, _farbe in werte},
-            })
-            if aktualisiere_marker_panel["fn"]:
-                aktualisiere_marker_panel["fn"]()
+            if event.inaxes != ax or event.xdata is None or event.ydata is None:
+                return
+            canvas.get_tk_widget().focus_set()
+            auswahl["aktiv"] = True
+            auswahl["start_data"] = (event.xdata, event.ydata)
+            auswahl["start_disp"] = (event.x, event.y)
+
+        def _maus_bewegt_auswahl(event):
+            if not auswahl["aktiv"] or event.inaxes != ax or event.xdata is None or event.ydata is None:
+                return
+            x0, y0 = auswahl["start_data"]
+            _auswahl_vorschau_entfernen()
+            patch = mpatches.Rectangle(
+                (min(x0, event.xdata), min(y0, event.ydata)),
+                abs(event.xdata - x0), abs(event.ydata - y0),
+                fill=False, edgecolor="white", linewidth=1.2, linestyle="--", zorder=8,
+            )
+            ax.add_patch(patch)
+            auswahl["vorschau"] = patch
+            canvas.draw_idle()
+
+        def _maus_los(event):
+            if not auswahl["aktiv"]:
+                return
+            auswahl["aktiv"] = False
+            _auswahl_vorschau_entfernen()
+            start_disp = auswahl["start_disp"]
+            start_data = auswahl["start_data"]
+            if event.inaxes != ax or event.xdata is None or event.ydata is None:
+                canvas.draw_idle()
+                return
+            bewegt_px = ((event.x - start_disp[0]) ** 2 + (event.y - start_disp[1]) ** 2) ** 0.5
+            if bewegt_px < ZIEH_SCHWELLE_PX:
+                # Kurzer Klick (kaum Bewegung) -> wie bisher ein einzelner Punkt.
+                x = int(round(event.xdata))
+                y = int(round(event.ydata))
+                werte = _werte_am_pixel(x, y)
+                if werte is None:
+                    canvas.draw_idle()
+                    return
+                markierungen.append({
+                    "typ": "punkt", "x": x, "y": y,
+                    "werte": {element: wert for element, wert, _farbe in werte},
+                })
+            else:
+                # Rechteck aufgezogen -> Durchschnitts-Elementaranalyse ueber
+                # die Auswahl. Box wird an der oberen rechten Ecke verankert.
+                ergebnis = _durchschnitt_im_bereich(start_data[0], start_data[1], event.xdata, event.ydata)
+                if ergebnis is None:
+                    canvas.draw_idle()
+                    return
+                werte, (xa, ya, xb, yb) = ergebnis
+                markierungen.append({
+                    "typ": "rechteck",
+                    "x": xb, "y": ya,
+                    "x0": xa, "y0": ya, "x1": xb, "y1": yb,
+                    "breite": max(xb - xa + 1, 1), "hoehe": max(yb - ya + 1, 1),
+                    "werte": werte,
+                })
             zeichne()
+
+        def _bei_taste(event):
+            # ESC schliesst die zuletzt gesetzte Markierung (zusaetzlich zum
+            # Mini-"x"-Knopf direkt an der Box).
+            if event.key == "escape" and markierungen:
+                markierungen.pop()
+                zeichne()
 
         canvas.mpl_connect("motion_notify_event", _bei_maus_bewegung)
         canvas.mpl_connect("axes_leave_event", _bei_maus_verlassen)
-        canvas.mpl_connect("button_press_event", _bei_klick)
+        canvas.mpl_connect("button_press_event", _maus_runter)
+        canvas.mpl_connect("motion_notify_event", _maus_bewegt_auswahl)
+        canvas.mpl_connect("button_release_event", _maus_los)
+        canvas.mpl_connect("key_press_event", _bei_taste)
+
+        # --- Strg + Mausrad: Overlay-Diagramm um den Cursor herum zoomen
+        # (gleiches Prinzip wie im Rohdaten-Tab, hier nur 1 Achse statt 2).
+        # Ohne gedrueckte Strg-Taste passiert nichts, damit normales
+        # Scrollen der Seite/des Panels nicht gestoert wird. ---
+        def _strg_gedrueckt_ergebnisse(event):
+            gui_event = getattr(event, "guiEvent", None)
+            zustand_bits = getattr(gui_event, "state", 0)
+            try:
+                return bool(int(zustand_bits) & 0x0004)
+            except (TypeError, ValueError):
+                return False
+
+        def _strg_scroll_zoom(event):
+            if event.inaxes != ax or not _strg_gedrueckt_ergebnisse(event):
+                return
+            if event.button == "up":
+                faktor = 0.85
+            elif event.button == "down":
+                faktor = 1.0 / 0.85
+            else:
+                return
+            xlim0, ylim0 = ax.get_xlim(), ax.get_ylim()
+            breite0, hoehe0 = xlim0[1] - xlim0[0], ylim0[1] - ylim0[0]
+            rel_x = (event.xdata - xlim0[0]) / breite0 if breite0 else 0.5
+            rel_y = (event.ydata - ylim0[0]) / hoehe0 if hoehe0 else 0.5
+            neue_breite = breite0 * faktor
+            neue_hoehe = hoehe0 * faktor
+            mitte_x = xlim0[0] + rel_x * breite0
+            mitte_y = ylim0[0] + rel_y * hoehe0
+            ax.set_xlim(mitte_x - rel_x * neue_breite, mitte_x + (1 - rel_x) * neue_breite)
+            ax.set_ylim(mitte_y - rel_y * neue_hoehe, mitte_y + (1 - rel_y) * neue_hoehe)
+            canvas.draw_idle()
+
+        canvas.mpl_connect("scroll_event", _strg_scroll_zoom)
 
         def zeichne(zoom_beibehalten=True):
             pfad = ausgewaehlter_pfad["wert"]
@@ -4354,15 +5100,62 @@ class LaborApp(ctk.CTk):
             ax.imshow(overlay)
             ax.set_title(os.path.splitext(os.path.basename(pfad))[0])
 
-            # --- Markierungen ("Pins") als kleine nummerierte Kreise
-            # einzeichnen, damit man sie im Bild wiederfindet. ---
+            # --- Markierungen: kleiner nummerierter Kreis am Pixel (einzelner
+            # Klick) ODER gestricheltes Rechteck (Rechteck-Auswahl per
+            # Ziehen) + Box MIT DER (DURCHSCHNITTS-)ELEMENT-ZUSAMMENSETZUNG
+            # direkt daneben, die sofort "im Bild" aufpoppt (statt nur in
+            # einer Liste rechts) - jede neue Auswahl fuegt eine weitere,
+            # eigene Box hinzu. Mini-"x"-Knopf oben rechts an der Box
+            # schliesst genau diese eine Markierung wieder (siehe
+            # _klick_auf_x_knopf). ---
             for index, marker in enumerate(markierungen, start=1):
-                ax.plot(marker["x"], marker["y"], marker="o", markersize=9,
-                        markerfacecolor="none", markeredgecolor="white", markeredgewidth=2)
+                if marker.get("typ") == "rechteck":
+                    rect_patch = mpatches.Rectangle(
+                        (marker["x0"], marker["y0"]),
+                        marker["x1"] - marker["x0"], marker["y1"] - marker["y0"],
+                        fill=False, edgecolor="white", linewidth=1.6, linestyle="--", zorder=5,
+                    )
+                    ax.add_patch(rect_patch)
+                    ax.annotate(
+                        str(index), (marker["x0"], marker["y0"]), color="white", fontsize=9, fontweight="bold",
+                        xytext=(3, -3), textcoords="offset points", ha="left", va="top",
+                    )
+                else:
+                    ax.plot(marker["x"], marker["y"], marker="o", markersize=9,
+                            markerfacecolor="none", markeredgecolor="white", markeredgewidth=2)
+                    ax.annotate(
+                        str(index), (marker["x"], marker["y"]), color="white", fontsize=9, fontweight="bold",
+                        ha="center", va="center",
+                    )
+                zeilen, _breite_pts, _hoehe_pts = _markierung_box_inhalt(marker, index)
+                kopf = f"Ø{index}" if marker.get("typ") == "rechteck" else f"M{index}"
+                box_text = kopf + "\n" + ("\n".join(zeilen) if zeilen else "alle Elemente ~0 %")
                 ax.annotate(
-                    str(index), (marker["x"], marker["y"]), color="white", fontsize=9, fontweight="bold",
-                    ha="center", va="center",
+                    box_text,
+                    xy=(marker["x"], marker["y"]), xycoords="data",
+                    xytext=(16, 16), textcoords="offset points",
+                    fontsize=8, color="black", ha="left", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.35", fc="white", ec=MUL_TURKIS, alpha=0.92),
+                    arrowprops=dict(arrowstyle="->", color=MUL_TURKIS, lw=1.2),
+                    zorder=6,
                 )
+                x_knopf_offset = _x_knopf_offset_pts(marker, index)
+                ax.annotate(
+                    "✕",
+                    xy=(marker["x"], marker["y"]), xycoords="data",
+                    xytext=x_knopf_offset, textcoords="offset points",
+                    fontsize=8, color="white", fontweight="bold", ha="center", va="center",
+                    bbox=dict(boxstyle="circle,pad=0.22", fc="#c0392b", ec="white", lw=1),
+                    zorder=7,
+                )
+
+            # --- Massstabsbalken in Mikrometer (Kalibrierung "Mikrometer/
+            # Pixel" kommt aus dem Rohdaten-Tab, siehe mikrometer_pro_pixel). ---
+            kalibrierung = self.lade_rohdaten_filter_einstellungen_fuer_versuch(
+                projekt, methode, self.versuch_schluessel_rohdaten_filter(projekt, pfad),
+                {"mikrometer_pro_pixel": 1.0},
+            )
+            self._sem_aktualisiere_massstabsbalken(ax, kalibrierung.get("mikrometer_pro_pixel", 0.0))
 
             if vorherige_xlim is not None and vorherige_ylim is not None:
                 ax.set_xlim(vorherige_xlim)
@@ -4379,11 +5172,13 @@ class LaborApp(ctk.CTk):
             # machen keinen Sinn mehr (anderes Bild) - beides zuruecksetzen.
             bild_status["gezeichnet"] = False
             markierungen.clear()
-            if aktualisiere_marker_panel["fn"]:
-                aktualisiere_marker_panel["fn"]()
+            zeichne(zoom_beibehalten=False)
+            # ERST zeichnen (laedt aktuelle_daten["karten_normiert"] +
+            # element_farben fuer den NEUEN Versuch), DANN die Elementliste
+            # bauen - sonst wuerden die Haeufigkeits-Prozentwerte in der
+            # Liste noch die Werte des vorherigen Versuchs zeigen.
             if aktualisiere_element_panel["fn"]:
                 aktualisiere_element_panel["fn"]()
-            zeichne(zoom_beibehalten=False)
 
         for _staub, eintrag, voller_pfad in versuche:
             zeile = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -4419,7 +5214,12 @@ class LaborApp(ctk.CTk):
         ).pack(fill="x", padx=10, pady=(0, 5))
         ctk.CTkLabel(
             rechte_spalte,
-            text="Häkchen = im Overlay sichtbar. Klick auf den Farbkreis öffnet die Farbauswahl.",
+            text=(
+                "Häkchen = im Overlay sichtbar. Klick auf den Farbkreis öffnet "
+                "die Farbauswahl. Strg + Mausrad = Diagramm zoomen. Lupe in der "
+                "Toolbar: mit linker Maustaste ein Rechteck aufziehen = reinzoomen, "
+                "mit rechter Maustaste aufziehen = wieder rauszoomen."
+            ),
             font=("Arial", 10), text_color=("gray30", "gray70"),
             anchor="w", justify="left", wraplength=220,
         ).pack(fill="x", padx=10, pady=(0, 10))
@@ -4452,20 +5252,71 @@ class LaborApp(ctk.CTk):
             command=lambda: _alle_setzen(False),
         ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
+        # --- Sortier-Umschalter: "Häufigkeit" (Standard, absteigend nach
+        # mittlerem Flächenanteil %) oder "Alphabetisch". Wird projektweit
+        # mitgespeichert (wie element_farben/element_sichtbar). ---
+        SEM_SORTIER_OPTIONEN = ("haeufigkeit", "alphabetisch")
+        if zustand.get("element_sortierung") not in SEM_SORTIER_OPTIONEN:
+            zustand["element_sortierung"] = "haeufigkeit"
+
+        sortier_zeile = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+        sortier_zeile.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(sortier_zeile, text="Sortieren nach:", font=("Arial", 11)).pack(side="left", padx=(0, 6))
+
+        sortier_button = ctk.CTkButton(sortier_zeile, text="", width=140, fg_color="transparent", border_width=1)
+
+        def _sortier_label():
+            return "🔢 Häufigkeit" if zustand["element_sortierung"] == "haeufigkeit" else "🔤 Alphabetisch"
+
+        def _sortierung_umschalten():
+            zustand["element_sortierung"] = (
+                "alphabetisch" if zustand["element_sortierung"] == "haeufigkeit" else "haeufigkeit"
+            )
+            sortier_button.configure(text=_sortier_label())
+            self.speichere_diagramm_einstellungen(projekt, methode, zustand)
+            _baue_element_zeilen()
+
+        sortier_button.configure(text=_sortier_label(), command=_sortierung_umschalten)
+        sortier_button.pack(side="left")
+
         element_liste_frame = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
         element_liste_frame.pack(fill="x", padx=0, pady=(0, 5))
+
+        def _element_haeufigkeiten():
+            """
+            Mittlerer Flächenanteil (%) je Element ueber ALLE Pixel des
+            aktuell geladenen Versuchs (aktuelle_daten["karten_normiert"] -
+            die auf 100%/Pixel normierten Karten, siehe
+            _sem_normalisiere_elementkarten). Liefert {element: mittelwert}.
+            Ohne geladene Karten (noch kein Versuch gewaehlt) -> leeres Dict,
+            dann wird weiter unten alphabetisch sortiert.
+            """
+            karten = aktuelle_daten.get("karten_normiert")
+            if not karten:
+                return {}
+            return {element: float(np.nanmean(karte)) for element, karte in karten.items()}
 
         def _baue_element_zeilen():
             for kind in element_liste_frame.winfo_children():
                 kind.destroy()
 
-            elemente = sorted(zustand.get("element_farben", {}).keys())
-            if not elemente:
+            alle_elemente = list(zustand.get("element_farben", {}).keys())
+            if not alle_elemente:
                 ctk.CTkLabel(
                     element_liste_frame, text="Versuch auswählen, um Elemente zu laden.",
                     text_color=("gray40", "gray60"), wraplength=220,
                 ).pack(padx=10, pady=10)
                 return
+
+            haeufigkeiten = _element_haeufigkeiten()
+            if zustand["element_sortierung"] == "haeufigkeit" and haeufigkeiten:
+                # Absteigend nach mittlerem %-Anteil; Elemente ohne Wert
+                # (sollte praktisch nicht vorkommen) landen ganz hinten.
+                elemente = sorted(
+                    alle_elemente, key=lambda e: -haeufigkeiten.get(e, -1.0)
+                )
+            else:
+                elemente = sorted(alle_elemente)
 
             for element in elemente:
                 zeile = ctk.CTkFrame(element_liste_frame, fg_color=("gray90", "gray20"))
@@ -4478,18 +5329,33 @@ class LaborApp(ctk.CTk):
                     self.speichere_diagramm_einstellungen(projekt, methode, zustand)
                     zeichne()
 
+                # Beschriftung inkl. mittlerem Flächenanteil, z.B. "C  45.2 %"
+                # (nur wenn schon Daten geladen sind - vor der ersten
+                # Versuchsauswahl gibt es noch keine Prozentwerte).
+                anteil = haeufigkeiten.get(element)
+                beschriftung = f"{element}   {anteil:.1f} %" if anteil is not None else element
+
                 ctk.CTkCheckBox(
-                    zeile, text=element, variable=sichtbar_var, command=_sichtbar_geaendert,
+                    zeile, text=beschriftung, variable=sichtbar_var, command=_sichtbar_geaendert,
                 ).pack(side="left", padx=(8, 4), pady=6, fill="x", expand=True)
 
-                aktuelle_farbe = zustand["element_farben"].get(element, "#ffffff")
+                # Farbe absichern: hover_color (anders als fg_color) akzeptiert
+                # bei CTkButton kein "transparent" - falls in den gespeicherten
+                # Einstellungen (z.B. aeltere/kaputte diagramm_einstellungen.json)
+                # aus irgendeinem Grund kein gueltiger Hex-Wert steht, faengt
+                # das hier ab, statt die ganze Seite mit ValueError abstuerzen
+                # zu lassen.
+                aktuelle_farbe = self._sem_sichere_hex_farbe(
+                    zustand["element_farben"].get(element)
+                )
+                zustand["element_farben"][element] = aktuelle_farbe
                 farb_button = ctk.CTkButton(
                     zeile, text="", width=28, height=20, fg_color=aktuelle_farbe,
                     hover_color=aktuelle_farbe, border_width=1, border_color=("gray50", "gray50"),
                 )
 
                 def _farbe_waehlen(element=element, button=farb_button):
-                    start_farbe = zustand["element_farben"].get(element, "#ffffff")
+                    start_farbe = self._sem_sichere_hex_farbe(zustand["element_farben"].get(element))
                     ergebnis = colorchooser.askcolor(color=start_farbe, title=f"Farbe für {element}")
                     neue_farbe_hex = ergebnis[1] if ergebnis else None
                     if not neue_farbe_hex:
@@ -4503,92 +5369,6 @@ class LaborApp(ctk.CTk):
                 farb_button.pack(side="right", padx=(4, 8), pady=6)
 
         aktualisiere_element_panel["fn"] = _baue_element_zeilen
-
-        # --- Markierungen ("Pins") + Vergleichs-Liste: zeigt fuer jede per
-        # Klick gesetzte Markierung die Element-%-Werte an genau dieser
-        # Bildstelle; der jeweils HOECHSTE Wert je Element ist fett/gruen
-        # hervorgehoben, damit auf einen Blick erkennbar ist, an welcher
-        # Markierung von einem Element am meisten vorhanden ist. ---
-        ctk.CTkFrame(rechte_spalte, fg_color=("gray70", "gray30"), height=1).pack(fill="x", padx=10, pady=(10, 10))
-        ctk.CTkLabel(
-            rechte_spalte, text="Markierungen (Vergleich)", font=("Arial", 14, "bold")
-        ).pack(fill="x", padx=10, pady=(0, 5))
-        ctk.CTkLabel(
-            rechte_spalte,
-            text="„📍 Marker setzen“ unten aktivieren, dann ins Bild klicken. Der höchste Wert je Element ist grün markiert.",
-            font=("Arial", 10), text_color=("gray30", "gray70"),
-            anchor="w", justify="left", wraplength=220,
-        ).pack(fill="x", padx=10, pady=(0, 8))
-
-        marker_liste_frame = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
-        marker_liste_frame.pack(fill="x", padx=0, pady=(0, 5))
-
-        def _marker_entfernen(marker):
-            if marker in markierungen:
-                markierungen.remove(marker)
-            _baue_marker_liste()
-            zeichne()
-
-        def _marker_alle_loeschen():
-            markierungen.clear()
-            _baue_marker_liste()
-            zeichne()
-
-        def _baue_marker_liste():
-            for kind in marker_liste_frame.winfo_children():
-                kind.destroy()
-
-            if not markierungen:
-                ctk.CTkLabel(
-                    marker_liste_frame, text="Noch keine Markierungen gesetzt.",
-                    text_color=("gray40", "gray60"), wraplength=220,
-                ).pack(padx=10, pady=(0, 10))
-                return
-
-            # Hoechsten Wert je Element ueber ALLE Markierungen ermitteln,
-            # um ihn unten hervorzuheben (Kern der "Vergleich"-Funktion).
-            maxima = {}
-            for marker in markierungen:
-                for element, wert in marker["werte"].items():
-                    if wert >= 0.05 and wert > maxima.get(element, -1.0):
-                        maxima[element] = wert
-
-            for index, marker in enumerate(markierungen, start=1):
-                zeile = ctk.CTkFrame(marker_liste_frame, fg_color=("gray90", "gray20"))
-                zeile.pack(fill="x", padx=10, pady=3)
-
-                kopf = ctk.CTkFrame(zeile, fg_color="transparent")
-                kopf.pack(fill="x", padx=8, pady=(6, 2))
-                ctk.CTkLabel(
-                    kopf, text=f"M{index}  ·  Pixel ({marker['x']}, {marker['y']})",
-                    font=("Arial", 11, "bold"), anchor="w",
-                ).pack(side="left", fill="x", expand=True)
-                ctk.CTkButton(
-                    kopf, text="✕", width=22, height=20, fg_color="transparent",
-                    border_width=1, command=lambda m=marker: _marker_entfernen(m),
-                ).pack(side="right")
-
-                top_werte = sorted(marker["werte"].items(), key=lambda kv: -kv[1])[:6]
-                for element, wert in top_werte:
-                    if wert < 0.05:
-                        continue
-                    ist_maximum = len(markierungen) > 1 and abs(wert - maxima.get(element, -1.0)) < 1e-9
-                    ctk.CTkLabel(
-                        zeile,
-                        text=f"{element}: {wert:.1f}%" + ("  ▲ am meisten" if ist_maximum else ""),
-                        font=("Arial", 10, "bold" if ist_maximum else "normal"),
-                        text_color=("#0a7a2e", "#4ade80") if ist_maximum else None,
-                        anchor="w",
-                    ).pack(fill="x", padx=16, pady=1)
-                ctk.CTkFrame(zeile, fg_color="transparent", height=4).pack()
-
-            ctk.CTkButton(
-                marker_liste_frame, text="Alle Markierungen löschen", fg_color="transparent",
-                border_width=1, border_color=MUL_TURKIS, command=_marker_alle_loeschen,
-            ).pack(fill="x", padx=10, pady=(4, 10))
-
-        aktualisiere_marker_panel["fn"] = _baue_marker_liste
-        _baue_marker_liste()
 
         # --- Ersten Versuch automatisch auswaehlen ---
         waehle_versuch(versuche[0][2])

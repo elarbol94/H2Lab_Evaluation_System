@@ -99,11 +99,52 @@ class EDSFilterParser:
         return True, "✓ Filter ist gültig"
 
 # --- KONFIGURATION ---
-BASIS_PFAD = os.environ.get("Dateipfad", "").strip()
+def _ermittle_basis_pfad():
+    """Liest Dateipfad aus VS Codes settings.json oder aus der Umgebung.
+
+    Ein Eintrag in den VS-Code-Einstellungen ist keine Betriebssystem-
+    Umgebungsvariable und steht deshalb in einer normal gestarteten
+    PowerShell nicht automatisch in ``os.environ``. Die VS-Code-Einstellung
+    hat Vorrang, damit eine alte Umgebungsvariable nicht versehentlich auf
+    einen einzelnen Projekt-Unterordner zeigt.
+    """
+    appdata = os.environ.get("APPDATA", "").strip()
+    einstellungsdateien = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vscode", "settings.json"),
+    ]
+    if appdata:
+        einstellungsdateien.extend([
+            os.path.join(appdata, "Code", "User", "settings.json"),
+            os.path.join(appdata, "Code - Insiders", "User", "settings.json"),
+        ])
+
+    # settings.json darf JSONC-Kommentare und abschliessende Kommata
+    # enthalten. Daher nur den benoetigten Stringwert gezielt auslesen.
+    muster = re.compile(r'["\']Dateipfad["\']\s*:\s*("(?:\\.|[^"\\])*")')
+    for einstellungspfad in einstellungsdateien:
+        try:
+            with open(einstellungspfad, "r", encoding="utf-8-sig") as datei:
+                inhalt = datei.read()
+            treffer = muster.search(inhalt)
+            if not treffer:
+                continue
+            wert = json.loads(treffer.group(1)).strip()
+            if wert:
+                return os.path.normpath(os.path.expandvars(os.path.expanduser(wert)))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            continue
+
+    umgebungswert = os.environ.get("Dateipfad", "").strip()
+    if umgebungswert:
+        return os.path.normpath(os.path.expandvars(os.path.expanduser(umgebungswert)))
+    return ""
+
+
+BASIS_PFAD = _ermittle_basis_pfad()
 if not BASIS_PFAD:
     raise RuntimeError(
-        "Die Umgebungsvariable 'Dateipfad' ist nicht gesetzt. "
-        "Bitte in der VS-Code-Umgebung einen Basispfad konfigurieren."
+        "'Dateipfad' wurde weder als Umgebungsvariable noch in den "
+        "VS-Code-Einstellungen gefunden."
     )
 MUL_TURKIS = "#008c96"
 MUL_DUNKEL = "#0a2a2d"
@@ -408,16 +449,16 @@ class LaborApp(ctk.CTk):
     #
     # BERECHNUNG DES MASSTABSBALKENS (gemäß Dokumentation):
     # =====================================================
-    # 1. Gewünschte Maßstabslänge: 200 µm = 0.2 mm (MASSSTABSBALKEN_LAENGE_UM)
+    # 1. Gewünschte Maßstabslänge: 1000 µm = 1 mm (MASSSTABSBALKEN_LAENGE_UM)
     # 2. Pixelgröße: 0.84427 µm/Pixel (aus H5OINA oder manuell gesetzt)
     # 3. Formel: Pixel = µm ÷ µm_pro_Pixel
-    # 4. Berechnung: 200 µm ÷ 0.84427 µm/Pixel = 236.89 Pixel ≈ 237 Pixel
+    # 4. Berechnung: 1000 µm ÷ 0.84427 µm/Pixel = 1184.45 Pixel
     #
     # Beim Zoomen im Browser:
-    # - Die physikalische Beschriftung bleibt "0.2 mm"
+    # - Die physikalische Beschriftung bleibt "1 mm"
     # - Die Pixel-Länge wird mit Zoom-Faktor multipliziert
     # - Das Verhältnis zwischen Balken und Bild bleibt korrekt
-    MASSSTABSBALKEN_LAENGE_UM = 200
+    MASSSTABSBALKEN_LAENGE_UM = 1000
 
     def __init__(self):
         super().__init__()
@@ -3191,7 +3232,7 @@ class LaborApp(ctk.CTk):
     def _sem_aktualisiere_massstabsbalken(self, ax, um_pro_px):
         """
         Zeichnet/aktualisiert den Maßstabsbalken in `ax` mit einer FESTEN
-        Länge von MASSSTABSBALKEN_LAENGE_UM (Standard: 200 µm), umgerechnet
+        Länge von MASSSTABSBALKEN_LAENGE_UM (Standard: 1000 µm), umgerechnet
         über die Kalibrierung `um_pro_px` (Mikrometer/Pixel, Standard:
         0.84427 µm/Pixel, vom Nutzer editierbar im Rohdaten-Tab) in die
         entsprechende Pixel-Breite. Bei um_pro_px <= 0 wird nur der
@@ -3218,16 +3259,16 @@ class LaborApp(ctk.CTk):
         if sichtbare_breite_px <= 0:
             return
 
-        # Feste Balkenlaenge von 200 Mikrometer (statt automatisch
+        # Feste Balkenlaenge von 1000 Mikrometer (statt automatisch
         # gewaehlter "schoener" Rundungszahl basierend auf dem sichtbaren
         # Ausschnitt). Bei Bedarf ueber MASSSTABSBALKEN_LAENGE_UM anpassbar.
         #
         # === MASSTABSBALKEN-BERECHNUNG (nach Dokumentation - Schritt 6) ===
-        # Gewünschte Länge: 200 µm (= 0.2 mm)
+        # Gewünschte Länge: 1000 µm (= 1 mm)
         # Pixelgröße: 0.84427 µm/Pixel (aus H5OINA oder manuell)
         # Berechnung: balken_px = balken_um / um_pro_px
-        #            balken_px = 200 µm / 0.84427 µm/Pixel
-        #            balken_px ≈ 236.89 Pixel → 237 Pixel (gerundet)
+        #            balken_px = 1000 µm / 0.84427 µm/Pixel
+        #            balken_px ≈ 1184.45 Pixel
         balken_px, balken_um = self._sem_berechne_massstabsbalken_pixel(um_pro_px)
         if balken_px is None or balken_um is None:
             return
@@ -3252,7 +3293,11 @@ class LaborApp(ctk.CTk):
             [rand_x, rand_x + balken_px], [y_balken, y_balken],
             color="black", linewidth=3, solid_capstyle="butt", zorder=5,
         )
-        beschriftung = f"{balken_um:g} µm"
+        beschriftung = (
+            f"{balken_um / 1000:g} mm"
+            if balken_um >= 1000 and balken_um % 1000 == 0
+            else f"{balken_um:g} µm"
+        )
         text = ax.text(
             rand_x + balken_px / 2, text_y, beschriftung,
             color="black", fontsize=9, fontweight="bold", ha="center", va=va, zorder=5,
@@ -3273,19 +3318,19 @@ class LaborApp(ctk.CTk):
 
         Returns:
             tuple: (balken_px, balken_um)
-                   - balken_px: Pixel-Breite (gerundet), z.B. 237 Pixel
-                   - balken_um: Mikrometer-Länge, z.B. 200 µm
+                   - balken_px: Pixel-Breite, z.B. 1184.45 Pixel
+                   - balken_um: Mikrometer-Länge, z.B. 1000 µm
 
         Beispiel:
             >>> app = LaborApp()
             >>> px, um = app._sem_berechne_massstabsbalken_pixel(0.84427)
             >>> print(f"Balken: {um} µm = {px:.0f} Pixel")
-            Balken: 200 µm = 237 Pixel
+            Balken: 1000 µm = 1184 Pixel
 
         Dokumentation:
-            - L_µm = 200 µm (MASSSTABSBALKEN_LAENGE_UM, feste Länge)
+            - L_µm = 1000 µm (MASSSTABSBALKEN_LAENGE_UM, feste Länge)
             - s_µm/Pixel = 0.84427 µm/Pixel (aus H5OINA oder manuell)
-            - L_Pixel = 200 / 0.84427 = 236.89 ≈ 237 Pixel
+            - L_Pixel = 1000 / 0.84427 = 1184.45 Pixel
         """
         if not um_pro_px or um_pro_px <= 0:
             return None, None
@@ -3294,6 +3339,26 @@ class LaborApp(ctk.CTk):
         balken_px = balken_um / um_pro_px
 
         return balken_px, balken_um
+
+    @staticmethod
+    def _sem_kalibrierung_fuer_vorschaubreite(um_pro_px, referenz_breite, vorschau_breite):
+        """Uebertraegt die Layered-Image-Kalibrierung auf ein Vorschauarray.
+
+        Matplotlib zeichnet Rohdaten-Elementkarten in deren nativer Breite
+        (z.B. 512 Pixel), waehrend die physikalische Kalibrierung fuer das
+        EDS Layered Image (z.B. 8192 Pixel) hinterlegt ist. Damit der Balken
+        in beiden Ansichten denselben Anteil am Sichtfeld einnimmt, muss ein
+        Vorschaupixel entsprechend mehr Mikrometer repraesentieren.
+        """
+        try:
+            um_pro_px = float(um_pro_px)
+            referenz_breite = float(referenz_breite)
+            vorschau_breite = float(vorschau_breite)
+        except (TypeError, ValueError):
+            return um_pro_px
+        if um_pro_px <= 0 or referenz_breite <= 0 or vorschau_breite <= 0:
+            return um_pro_px
+        return um_pro_px * referenz_breite / vorschau_breite
 
     def _sem_massstab_texteffekt(self):
         # Duenne weisse Kontur um die schwarze Maßstabs-Beschriftung, damit
@@ -3411,16 +3476,44 @@ class LaborApp(ctk.CTk):
         ax_rechts.set_xticks([])
         ax_rechts.set_yticks([])
 
-        um_pro_px, _um_pro_px_quelle = self._sem_ermittle_um_pro_pixel(
-            voller_pfad, zustand.get("mikrometer_pro_pixel", 0.0)
+        manueller_wert = zustand.get("mikrometer_pro_pixel", 0.0)
+        eds_um_pro_px, _ = self._sem_ermittle_um_pro_pixel(
+            voller_pfad, manueller_wert, quelle="eds"
         )
-        for ax_massstab in (ax_links, ax_rechts):
+        # Referenzbreite immer direkt aus dem EDS-Layered-TIFF im TIF-Ordner
+        # lesen. Die beiden Rohdatenachsen verwenden dagegen ihre jeweiligen
+        # Arraybreiten (Backscatter bzw. 512px-Elementkarte). Ohne diese
+        # Umrechnung wurde ein 1-mm-Balken fast ueber die gesamte Vorschau
+        # gezeichnet, obwohl er im 8192px-Ergebnisbild korrekt war.
+        referenz_breite = None
+        if eds_layered_pfad:
+            try:
+                from PIL import Image
+                with Image.open(eds_layered_pfad) as eds_bild:
+                    referenz_breite = eds_bild.size[0]
+            except Exception as exc:
+                print(f"[SEM Maßstab] TIFF-Breite nicht lesbar ({eds_layered_pfad}): {exc}")
+        if not referenz_breite:
+            referenz_breite = ausgangsbild.shape[1]
+
+        links_um_pro_px = self._sem_kalibrierung_fuer_vorschaubreite(
+            eds_um_pro_px, referenz_breite, ausgangsbild.shape[1]
+        )
+        referenzkarte = next(iter(elementkarten.values()))
+        rechts_um_pro_px = self._sem_kalibrierung_fuer_vorschaubreite(
+            eds_um_pro_px, referenz_breite, referenzkarte.shape[1]
+        )
+
+        for ax_massstab, achsen_um_pro_px in (
+            (ax_links, links_um_pro_px),
+            (ax_rechts, rechts_um_pro_px),
+        ):
             # Vollansicht (Grenzen direkt nach dem Neuzeichnen, bevor
             # irgendein Pan/Zoom passiert ist) fuer den Doppelklick-Reset
             # merken (siehe _on_press/_vollansicht_setzen in
             # baue_rohdaten_tab_sem).
             ax_massstab._sem_vollansicht = (ax_massstab.get_xlim(), ax_massstab.get_ylim())
-            self._sem_aktualisiere_massstabsbalken(ax_massstab, um_pro_px)
+            self._sem_aktualisiere_massstabsbalken(ax_massstab, achsen_um_pro_px)
 
         fig.tight_layout()
         canvas.draw()
@@ -5215,10 +5308,16 @@ class LaborApp(ctk.CTk):
             if not karten:
                 return None
             beispiel_karte = next(iter(karten.values()))
-            if not (0 <= y < beispiel_karte.shape[0] and 0 <= x < beispiel_karte.shape[1]):
+            anzeige_h, anzeige_w = aktuelle_daten.get("anzeige_shape", beispiel_karte.shape[:2])
+            if not (0 <= y < anzeige_h and 0 <= x < anzeige_w):
                 return None
+            # Maus-/Markerkoordinaten liegen in den echten Pixelkoordinaten
+            # des EDS Layered Image (z.B. 8192x5376). Fuer den Datenzugriff
+            # auf die Elementkarten (z.B. 512x336) proportional umrechnen.
+            karten_x = min(int(x * beispiel_karte.shape[1] / anzeige_w), beispiel_karte.shape[1] - 1)
+            karten_y = min(int(y * beispiel_karte.shape[0] / anzeige_h), beispiel_karte.shape[0] - 1)
             werte = sorted(
-                ((element, float(karte[y, x])) for element, karte in karten.items()),
+                ((element, float(karte[karten_y, karten_x])) for element, karte in karten.items()),
                 key=lambda kv: -kv[1],
             )
             return [
@@ -5248,17 +5347,22 @@ class LaborApp(ctk.CTk):
                 return None
             beispiel_karte = next(iter(karten.values()))
             hoehe_bild, breite_bild = beispiel_karte.shape[0], beispiel_karte.shape[1]
-            xa, xb = sorted((int(round(x0)), int(round(x1))))
-            ya, yb = sorted((int(round(y0)), int(round(y1))))
-            xa = max(0, min(xa, breite_bild - 1))
-            xb = max(0, min(xb, breite_bild - 1))
-            ya = max(0, min(ya, hoehe_bild - 1))
-            yb = max(0, min(yb, hoehe_bild - 1))
+            anzeige_h, anzeige_w = aktuelle_daten.get("anzeige_shape", beispiel_karte.shape[:2])
+            anzeige_xa, anzeige_xb = sorted((int(round(x0)), int(round(x1))))
+            anzeige_ya, anzeige_yb = sorted((int(round(y0)), int(round(y1))))
+            anzeige_xa = max(0, min(anzeige_xa, anzeige_w - 1))
+            anzeige_xb = max(0, min(anzeige_xb, anzeige_w - 1))
+            anzeige_ya = max(0, min(anzeige_ya, anzeige_h - 1))
+            anzeige_yb = max(0, min(anzeige_yb, anzeige_h - 1))
+            xa = min(int(anzeige_xa * breite_bild / anzeige_w), breite_bild - 1)
+            xb = min(int(anzeige_xb * breite_bild / anzeige_w), breite_bild - 1)
+            ya = min(int(anzeige_ya * hoehe_bild / anzeige_h), hoehe_bild - 1)
+            yb = min(int(anzeige_yb * hoehe_bild / anzeige_h), hoehe_bild - 1)
             if xb < xa or yb < ya:
                 return None
             return (
                 {element: float(np.mean(karte[ya:yb + 1, xa:xb + 1])) for element, karte in karten.items()},
-                (xa, ya, xb, yb),
+                (anzeige_xa, anzeige_ya, anzeige_xb, anzeige_yb),
             )
 
         def _markierung_box_inhalt(marker, index):
@@ -5460,7 +5564,7 @@ class LaborApp(ctk.CTk):
                 bild_status["gezeichnet"] = False
                 canvas.draw()
                 return
-            elementkarten, _eds_pfad = self._sem_lade_elementkarten(pfad)
+            elementkarten, eds_pfad = self._sem_lade_elementkarten(pfad)
             if not elementkarten:
                 aktuelle_daten["karten_normiert"] = None
                 bild_status["gezeichnet"] = False
@@ -5474,6 +5578,21 @@ class LaborApp(ctk.CTk):
             # "wie viel % Zink befindet sich an dieser Stelle").
             karten_prozent = self._sem_normalisiere_elementkarten(elementkarten)
             aktuelle_daten["karten_normiert"] = karten_prozent
+
+            # Zeichenflaeche immer aus den echten Abmessungen des EDS Layered
+            # Image im TIF-Ordner bestimmen. Das Overlay bleibt als
+            # 512x336-Array speicherschonend und wird von imshow auf diese
+            # 8192x5376-Pixelkoordinaten abgebildet.
+            beispiel_karte = next(iter(elementkarten.values()))
+            anzeige_h, anzeige_w = beispiel_karte.shape[:2]
+            if eds_pfad:
+                try:
+                    from PIL import Image
+                    with Image.open(eds_pfad) as eds_bild:
+                        anzeige_w, anzeige_h = eds_bild.size
+                except Exception as exc:
+                    print(f"[SEM Maßstab] TIFF-Abmessungen nicht lesbar ({eds_pfad}): {exc}")
+            aktuelle_daten["anzeige_shape"] = (anzeige_h, anzeige_w)
 
             # --- Nur die im Rohdaten-Tab GEFILTERTEN Pixel anzeigen: die
             # dort eingestellten Schwellwert-Filter (z.B. "C < 30") werden
@@ -5498,7 +5617,11 @@ class LaborApp(ctk.CTk):
                 elementkarten, zustand, karten_prozent=karten_prozent, pixel_maske=pixel_maske,
             )
             ax.set_facecolor("white")
-            ax.imshow(overlay)
+            ax.imshow(
+                overlay,
+                extent=(-0.5, anzeige_w - 0.5, anzeige_h - 0.5, -0.5),
+                interpolation="nearest",
+            )
             ax.set_title(os.path.splitext(os.path.basename(pfad))[0])
 
             # --- Markierungen: kleiner nummerierter Kreis am Pixel (einzelner
@@ -5559,13 +5682,13 @@ class LaborApp(ctk.CTk):
                 {"mikrometer_pro_pixel": 0.84427},
             )
             um_pro_px, _um_pro_px_quelle = self._sem_ermittle_um_pro_pixel(
-                pfad, kalibrierung.get("mikrometer_pro_pixel", 0.0)
+                pfad, kalibrierung.get("mikrometer_pro_pixel", 0.0), quelle="eds"
             )
-            self._sem_aktualisiere_massstabsbalken(ax, um_pro_px)
 
             if vorherige_xlim is not None and vorherige_ylim is not None:
                 ax.set_xlim(vorherige_xlim)
                 ax.set_ylim(vorherige_ylim)
+            self._sem_aktualisiere_massstabsbalken(ax, um_pro_px)
             bild_status["gezeichnet"] = True
             fig.tight_layout()
             canvas.draw()
@@ -7490,4 +7613,10 @@ class LaborApp(ctk.CTk):
 
 if __name__ == "__main__":
     app = LaborApp()
-    app.mainloop()
+    try:
+        app.mainloop()
+    except KeyboardInterrupt:
+        # Ctrl+C ist ein normaler Benutzerabbruch. Das Fenster sauber
+        # schliessen, damit CustomTkinter keine ausstehenden after()-Callbacks
+        # (update/check_dpi_scaling) gegen bereits zerstoerte Widgets ausfuehrt.
+        app.beim_schliessen()

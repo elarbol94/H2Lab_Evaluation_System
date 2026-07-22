@@ -3685,6 +3685,18 @@ class LaborApp(ctk.CTk):
             self.zeichne_rohdaten_vorschau_sem(pfad, fig, achsen, canvas, zustand, aktuelle_daten=aktuelle_daten)
             _zeichne_markierungen()
             canvas.draw()
+            # WICHTIG: "Home"-Knopf (Haus-Symbol) der Toolbar reparieren.
+            # toolbar.update() ALLEIN reicht nicht - es LEERT nur den
+            # Verlaufsspeicher (Zurueck/Vor), setzt aber KEINEN neuen
+            # Home-Punkt. Ohne den anschliessenden push_current() ist der
+            # Verlauf danach leer, und der Haus-Knopf springt ins Leere
+            # (passiert nichts). push_current() legt die gerade gezeichnete
+            # Vollansicht als neuen Ausgangspunkt ab, auf den "Home" dann
+            # zuverlaessig zurueckspringt.
+            toolbar.update()
+            toolbar.push_current()
+
+
 
         # --- Strg + Mausrad: beide Diagramme SYNCHRON zoomen (um den
         # Cursor herum), damit man Ausgangsbild und gefiltertes Bild
@@ -5082,45 +5094,53 @@ class LaborApp(ctk.CTk):
             if element not in zustand["element_sichtbar"]:
                 zustand["element_sichtbar"][element] = True
 
-    def _sem_baue_element_farbbild(self, karte, element, zustand, karten_prozent=None, pixel_maske=None):
+    def _sem_baue_element_farbbild(self, karte, element, zustand, karten_prozent=None, pixel_maske=None,
+                                    probe_maske=None):
         """
         Baut das farbige Bild fuer GENAU EINE Elementkarte mittels einer
-        echten Farbskala (Colormap), ausgehend von den rohen 16-Bit-
-        Grauwerten des TIFs (0 - 65535 je Pixel):
+        echten Farbskala (Colormap).
 
-          1. Pixelwert aus dem TIF (unveraendert, `karte`).
+          1. Pixelwert = tatsaechlicher, quantifizierter Element-Prozentwert
+             (`karten_prozent[element]`), NICHT der rohe 16-Bit-Grauwert -
+             so zeigt die Skala echte %-Werte (z.B. "8.3 % Sauerstoff")
+             statt einer Naeherung auf Basis des 16-Bit-Wertebereichs.
           2. Normierung auf [0, 1]: n(x) = clip((x - x_min) / (x_max - x_min), 0, 1)
-             mit x_min = tatsaechliches Minimum der Karte (i.d.R. 0) und
-             x_max abhaengig vom Skalierungs-Modus (siehe unten).
+             mit x_min/x_max NUR aus den Pixeln berechnet, die sich
+             innerhalb der Probe befinden (`probe_maske`/`pixel_maske`) -
+             der Hintergrund ausserhalb der Probe (der ueberall 0 % ist)
+             darf die Skala nicht verfaelschen.
           3. Zuordnung des normierten Werts zu SEM_FARBSKALA_COLORMAP:
              niedrige Werte -> dunkle/kalte Farbe, hohe Werte -> helle/
              warme Farbe.
 
         Modus `zustand["farbskalierung"]` (siehe SEM_FARBSKALIERUNG_OPTIONEN)
-        bestimmt NUR die Obergrenze x_max der Normierung - die Rohdaten und
-        die Pixelgeometrie bleiben in beiden Faellen unveraendert:
-          "linear" - x_max = tatsaechliches Maximum der Karte. Einzelne sehr
-                     helle Ausreisser koennen dadurch den Grossteil der
-                     Farbskala beanspruchen, der Rest wirkt vergleichsweise
-                     dunkel/kontrastarm.
-          "p99"    - x_max = 99. Perzentil der Karte. Die obersten ~1% der
-                     Pixelwerte werden auf die Endfarbe gekappt, der
-                     restliche (relevante) Wertebereich wird staerker ueber
-                     die Farbskala verteilt -> schwaechere raeumliche
-                     Strukturen werden deutlicher sichtbar.
+        bestimmt NUR die Obergrenze x_max der Normierung - die zugrunde
+        liegenden Prozentwerte bleiben in beiden Faellen unveraendert:
+          "linear" - x_max = tatsaechliches Maximum des Elements INNERHALB
+                     DER PROBE. Das ist genau der hoechste in der Probe
+                     vorkommende %-Wert dieses Elements und steht dann
+                     ganz oben an der Farbskala.
+          "p99"    - x_max = 99. Perzentil innerhalb der Probe. Die
+                     obersten ~1% der Pixelwerte werden auf die Endfarbe
+                     gekappt, der restliche (relevante) Wertebereich wird
+                     staerker ueber die Farbskala verteilt -> schwaechere
+                     raeumliche Strukturen werden deutlicher sichtbar.
 
-        `karten_prozent`/`mindestanteil` (optional, wie zuvor): Pixel, an
-        denen dieses Element WENIGER als den eingestellten Prozentsatz zur
-        lokalen Zusammensetzung beitraegt, werden auf die dunkelste
+        `mindestanteil` (optional, wie zuvor): Pixel, an denen dieses
+        Element WENIGER als den eingestellten Prozentsatz zur lokalen
+        Zusammensetzung beitraegt, werden auf die dunkelste
         Farbskalenfarbe gesetzt (== "kein/kaum Signal hier").
 
         `pixel_maske` (optional): boolesche Maske (Rohdaten-Tab-Filter) -
         ist sie gesetzt, werden NUR die gefilterten Pixel eingefaerbt; alle
-        anderen erscheinen weiss, analog zum Rohdaten-Tab.
+        anderen erscheinen weiss, analog zum Rohdaten-Tab. Sie wird -
+        zusammen mit `probe_maske`, falls `pixel_maske` fehlt - auch fuer
+        die Berechnung von x_min/x_max verwendet.
 
-        Gibt (rgb_bild, x_min, x_max) zurueck; x_min/x_max werden fuer die
-        Farbskalen-Legende (Colorbar) im Diagramm gebraucht. Bei leerer/
-        konstanter Karte: (None, 0.0, 0.0).
+        Gibt (rgb_bild, x_min, x_max) zurueck; x_min/x_max sind ECHTE
+        Element-Prozentwerte (0-100) und werden fuer die Farbskalen-Legende
+        (Colorbar) im Diagramm gebraucht. Bei leerer/konstanter Karte:
+        (None, 0.0, 0.0).
         """
         import numpy as np
         import matplotlib as mpl
@@ -5128,15 +5148,28 @@ class LaborApp(ctk.CTk):
         if karte is None or karte.size == 0:
             return None, 0.0, 0.0
 
-        x_min = float(np.min(karte))
-        if zustand.get("farbskalierung", "p99") == "linear":
-            x_max = float(np.max(karte))
+        prozent_karte = karten_prozent.get(element) if karten_prozent else None
+        # Fallback auf die rohen Grauwerte, falls (aus irgendeinem Grund)
+        # keine quantifizierte %-Karte fuer dieses Element vorliegt.
+        basis_karte = prozent_karte if prozent_karte is not None else karte
+
+        maske_fuer_skala = pixel_maske if pixel_maske is not None else probe_maske
+        if maske_fuer_skala is not None and maske_fuer_skala.shape == basis_karte.shape and maske_fuer_skala.any():
+            werte_in_probe = basis_karte[maske_fuer_skala]
         else:
-            x_max = float(np.percentile(karte, 99))
+            # Keine gueltige Probe-Maske vorhanden -> auf die gesamte
+            # Karte ausweichen, statt mit einer leeren Auswahl abzustuerzen.
+            werte_in_probe = basis_karte.reshape(-1)
+
+        x_min = float(np.min(werte_in_probe))
+        if zustand.get("farbskalierung", "p99") == "linear":
+            x_max = float(np.max(werte_in_probe))
+        else:
+            x_max = float(np.percentile(werte_in_probe, 99))
         if x_max <= x_min:
             x_max = x_min + 1.0
 
-        normiert = np.clip((karte - x_min) / (x_max - x_min), 0.0, 1.0)
+        normiert = np.clip((basis_karte - x_min) / (x_max - x_min), 0.0, 1.0)
 
         mindestanteil = float(zustand.get("mindestanteil", 0.0) or 0.0)
         if mindestanteil > 0.0 and karten_prozent is not None and element in karten_prozent:
@@ -5710,7 +5743,7 @@ class LaborApp(ctk.CTk):
 
             bild, x_min, x_max = self._sem_baue_element_farbbild(
                 elementkarten[aktives_element], aktives_element, zustand,
-                karten_prozent=karten_prozent, pixel_maske=pixel_maske,
+                karten_prozent=karten_prozent, pixel_maske=pixel_maske, probe_maske=probe_maske,
             )
             ax.set_facecolor("white")
             if bild is not None:
@@ -5720,29 +5753,33 @@ class LaborApp(ctk.CTk):
                     interpolation="nearest",
                 )
                 # --- Farbskalen-Legende (Colorbar): zeigt, welcher
-                # 16-Bit-Grauwert (Signalintensitaet des gewaehlten
-                # Elements) welcher Farbe entspricht. x_max haengt vom
-                # Linear/p99-Modus ab (siehe _sem_baue_element_farbbild) -
-                # die Rohdaten selbst aendern sich dadurch NICHT. ---
+                # tatsaechliche Element-Prozentwert (nicht mehr die rohe
+                # 16-Bit-Grauwert-Naeherung) welcher Farbe entspricht.
+                # x_min/x_max kommen bereits als ECHTE %-Werte aus
+                # _sem_baue_element_farbbild und sind auf die Pixel
+                # INNERHALB DER PROBE beschraenkt - im Linear-Modus steht
+                # so oben an der Skala genau der hoechste in der Probe
+                # vorkommende %-Wert dieses Elements. ---
                 divider = make_axes_locatable(ax)
                 cax = divider.append_axes("right", size="4%", pad=0.12)
-                # Achse in % des vollen 16-Bit-Wertebereichs (0 - 65535,
-                # siehe SEM_16BIT_MAXIMUM) statt im rohen Signalwert: die
-                # Legende reicht nur bis zu dem Prozentwert, der in der
-                # Karte tatsaechlich vorkommt (x_max), nicht kuenstlich bis
-                # 100 % - die zugrundeliegende Normierung des Bilds (siehe
-                # _sem_baue_element_farbbild) bleibt exakt gleich, nur die
-                # Beschriftung der Legende aendert sich.
-                prozent_min = x_min / SEM_16BIT_MAXIMUM * 100.0
-                prozent_max = x_max / SEM_16BIT_MAXIMUM * 100.0
                 mappable = mcm.ScalarMappable(
-                    norm=Normalize(vmin=prozent_min, vmax=prozent_max), cmap=SEM_FARBSKALA_COLORMAP
+                    norm=Normalize(vmin=x_min, vmax=x_max), cmap=SEM_FARBSKALA_COLORMAP
                 )
                 colorbar = fig.colorbar(mappable, cax=cax)
                 skalierungs_label = SEM_FARBSKALIERUNG_LABELS.get(
                     zustand.get("farbskalierung", "p99"), "p99"
                 )
-                colorbar.set_label(f"Signalintensität in % vom Maximum – {skalierungs_label}", fontsize=9)
+                colorbar.set_label(f"{aktives_element}-Anteil in % – {skalierungs_label}", fontsize=9)
+                # WICHTIG: matplotlib waehlt die Tick-Positionen sonst
+                # automatisch "rund" (z.B. 0/10/20/...%) - der hoechste
+                # tatsaechlich vorkommende Wert (x_max) landet dadurch
+                # meist NICHT direkt am oberen Rand der Skala, sondern
+                # etwas darunter. Hier stattdessen ein festes Set von
+                # Ticks setzen, das x_min UND x_max garantiert einschliesst
+                # -> der hoechste Wert steht immer ganz oben mit eigener
+                # Beschriftung.
+                ticks = np.linspace(x_min, x_max, 6)
+                colorbar.set_ticks(ticks)
                 colorbar.ax.yaxis.set_major_formatter(PercentFormatter())
                 colorbar.ax.tick_params(labelsize=8)
                 farbskala_status["cax"] = cax
@@ -5819,17 +5856,18 @@ class LaborApp(ctk.CTk):
             if not kann_zoom_erhalten:
                 # Frischgezeichnetes Bild OHNE uebernommenen Zoom (neuer
                 # Versuch bzw. allererstes Zeichnen) = die tatsaechliche
-                # "Originalansicht". Der Toolbar-Startzustand (toolbar.update()
-                # direkt nach dem Erstellen) wurde dagegen VOR dem allerersten
-                # Bild gesetzt (leere 0-1-Achse) - der "Original view
-                # zuruecksetzen"-Knopf (Haus-Symbol) sprang deshalb auf diese
-                # leere Ansicht statt auf das echte Bild zurueck. Hier wird
-                # der Home-Zustand der Toolbar daher auf die gerade
-                # gezeichnete, unverzoomte Ansicht aktualisiert. NICHT
-                # aufrufen, wenn ein bestehender Zoom beibehalten wurde
-                # (kann_zoom_erhalten), sonst wuerde "Home" auf den Zoom
-                # statt auf die echte Originalansicht zurueckspringen.
+                # "Originalansicht". toolbar.update() ALLEIN reicht nicht -
+                # es LEERT nur den Verlaufsspeicher (Zurueck/Vor), setzt
+                # aber KEINEN neuen Home-Punkt. Ohne den anschliessenden
+                # push_current() ist der Verlauf danach leer, und der
+                # Haus-Knopf springt ins Leere (passiert nichts).
+                # push_current() legt die gerade gezeichnete Vollansicht
+                # als neuen Ausgangspunkt ab. NICHT aufrufen, wenn ein
+                # bestehender Zoom beibehalten wurde (kann_zoom_erhalten),
+                # sonst wuerde "Home" auf den Zoom statt auf die echte
+                # Originalansicht zurueckspringen.
                 toolbar.update()
+                toolbar.push_current()
 
         def waehle_versuch(voller_pfad):
             ausgewaehlter_pfad["wert"] = voller_pfad

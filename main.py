@@ -3258,6 +3258,122 @@ class LaborApp(ctk.CTk):
         labels, anzahl = ndimage.label(maske)
         return labels, anzahl
 
+    def _sem_filtere_kleine_cluster(self, labels, anzahl_cluster, mindestgroesse=3, nachbarschaft_px=5):
+        """
+        Blendet einzelne, isolierte Cluster mit weniger als `mindestgroesse`
+        Pixeln aus, SOFERN sich in ihrer unmittelbaren Nachbarschaft
+        (Umkreis von `nachbarschaft_px` Pixeln) KEIN groesserer Cluster
+        (>= mindestgroesse) befindet. Kleine Cluster direkt neben/nahe an
+        einem groesseren Cluster bleiben erhalten (vermutlich Teil derselben
+        realen Struktur, z.B. deren ausgefranster Rand); typischerweise
+        isoliertes Rauschen (kleiner Cluster, weit von allem anderen
+        entfernt) wird dagegen ausgeblendet.
+
+        Gibt eine boolesche Maske zurueck (gleiche Form wie `labels`):
+        True = dieser Pixel gehoert zu einem Cluster, der sichtbar bleiben
+        soll. Bei anzahl_cluster == 0 oder labels is None -> passende
+        All-False-Maske bzw. None.
+        """
+        import numpy as np
+        from scipy import ndimage
+
+        if labels is None:
+            return None
+        if anzahl_cluster == 0:
+            return np.zeros(labels.shape, dtype=bool)
+
+        cluster_ids = np.arange(1, anzahl_cluster + 1)
+        groessen = ndimage.sum(np.ones_like(labels), labels, index=cluster_ids)
+
+        grosse_ids = cluster_ids[groessen >= mindestgroesse]
+        kleine_ids = cluster_ids[groessen < mindestgroesse]
+
+        sichtbar = np.isin(labels, grosse_ids)
+        if kleine_ids.size == 0:
+            return sichtbar
+
+        radius = max(1, int(round(nachbarschaft_px)))
+        struktur = np.ones((2 * radius + 1, 2 * radius + 1), dtype=bool)
+        grosse_maske = sichtbar
+        grosse_umgebung = (
+            ndimage.binary_dilation(grosse_maske, structure=struktur)
+            if grosse_maske.any() else np.zeros_like(grosse_maske)
+        )
+
+        for label_id in kleine_ids:
+            cluster_maske = labels == label_id
+            # Kleiner Cluster bleibt sichtbar, wenn er (teilweise) in der
+            # unmittelbaren Umgebung eines groesseren Clusters liegt.
+            if np.any(cluster_maske & grosse_umgebung):
+                sichtbar |= cluster_maske
+
+        return sichtbar
+
+    def _sem_aktiviere_scrollrad_pan(self, canvas, achsen, toolbar):
+        """
+        Aktiviert fuer eine SEM-Karten-Canvas:
+          - Gedrueckt gehaltenes Scroll-Rad (mittlere Maustaste) + Ziehen:
+            verschiebt den Kartenausschnitt (Pan), unabhaengig vom
+            Toolbar-Pan-Werkzeug (das ueber die linke Maustaste laeuft und
+            dort bereits fuer die Punkt-/Rechteck-Markierung gebraucht wird).
+          - Doppelklick auf das Scroll-Rad: setzt den Zoom auf die zuletzt
+            per toolbar.push_current() hinterlegte Vollansicht zurueck
+            (aequivalent zum "Home"-Knopf der Toolbar).
+
+        `achsen`: Iterable der Achsen, die beim Pan SYNCHRON verschoben
+        werden sollen (bei mehreren Diagrammen nebeneinander, z.B.
+        Rohdaten-Tab: Ausgangsbild + gefiltertes Bild). Die Verschiebung
+        wird pro Achse ueber deren eigene transData umgerechnet, damit
+        unterschiedlich gezoomte/skalierte Achsen trotzdem korrekt und
+        synchron mitwandern.
+        """
+        achsen = tuple(achsen)
+        pan_status = {"aktiv": False, "start_px": None, "start_xlim": {}, "start_ylim": {}}
+
+        def _mittlere_maus_runter(event):
+            if event.button != 2:
+                return
+            if event.dblclick:
+                # Doppelklick auf dem Scroll-Rad -> Zoom zuruecksetzen.
+                pan_status["aktiv"] = False
+                try:
+                    toolbar.home()
+                except Exception:
+                    pass
+                canvas.draw_idle()
+                return
+            if event.inaxes not in achsen or event.x is None or event.y is None:
+                return
+            pan_status["aktiv"] = True
+            pan_status["start_px"] = (event.x, event.y)
+            pan_status["start_xlim"] = {a: a.get_xlim() for a in achsen}
+            pan_status["start_ylim"] = {a: a.get_ylim() for a in achsen}
+
+        def _mittlere_maus_bewegt(event):
+            if not pan_status["aktiv"] or event.x is None or event.y is None:
+                return
+            start_px = pan_status["start_px"]
+            for achse in achsen:
+                inv = achse.transData.inverted()
+                start_data_x, start_data_y = inv.transform(start_px)
+                aktuell_data_x, aktuell_data_y = inv.transform((event.x, event.y))
+                dx = start_data_x - aktuell_data_x
+                dy = start_data_y - aktuell_data_y
+                xlim0 = pan_status["start_xlim"][achse]
+                ylim0 = pan_status["start_ylim"][achse]
+                achse.set_xlim(xlim0[0] + dx, xlim0[1] + dx)
+                achse.set_ylim(ylim0[0] + dy, ylim0[1] + dy)
+            canvas.draw_idle()
+
+        def _mittlere_maus_los(event):
+            if event.button != 2:
+                return
+            pan_status["aktiv"] = False
+
+        canvas.mpl_connect("button_press_event", _mittlere_maus_runter)
+        canvas.mpl_connect("motion_notify_event", _mittlere_maus_bewegt)
+        canvas.mpl_connect("button_release_event", _mittlere_maus_los)
+
     def _sem_aktualisiere_massstabsbalken(self, ax, um_pro_px):
         """
         Zeichnet/aktualisiert den Maßstabsbalken in `ax` mit einer FESTEN
@@ -3465,6 +3581,21 @@ class LaborApp(ctk.CTk):
         if maske is not None:
             maske = maske & probe_maske
 
+        # --- "Kleine Cluster ausblenden": isolierte Cluster < 3 Pixel (ohne
+        # groesseren Cluster in der unmittelbaren Naehe) werden HIER schon
+        # aus der Maske entfernt - VOR dem Einfaerben/Anzeigen - damit sie
+        # tatsaechlich aus dem Bild verschwinden (nicht nur aus dem
+        # Cluster-Umriss). Laeuft unabhaengig davon, ob die Umrisse selbst
+        # angezeigt werden (siehe "cluster_anzeigen").
+        # SPEICHERE MASKE FUER MAUS-AUSBLENDUNG (Rechtsklick auf kleine Cluster). ---
+        zustand["_aktuelle_maske"] = maske.copy() if maske is not None else None
+        
+        if maske is not None and zustand.get("kleine_cluster_ausblenden", False):
+            _kb_labels, _kb_anzahl = self._sem_berechne_cluster(maske)
+            _kb_sichtbar = self._sem_filtere_kleine_cluster(_kb_labels, _kb_anzahl)
+            if _kb_sichtbar is not None:
+                maske = maske & _kb_sichtbar
+
         if ausgangsbild is not None and ist_farbig:
             basis_grau = np.mean(np.asarray(ausgangsbild, dtype=np.float64)[..., :3], axis=-1)
         elif ausgangsbild is not None:
@@ -3489,6 +3620,9 @@ class LaborApp(ctk.CTk):
 
         anzahl_cluster = 0
         if maske is not None and zustand.get("cluster_anzeigen", True):
+            # `maske` ist an dieser Stelle bereits um evtl. ausgeblendete
+            # kleine Cluster bereinigt (siehe oben) - der Umriss zeigt also
+            # automatisch nur noch die tatsaechlich sichtbaren Cluster.
             _labels, anzahl_cluster = self._sem_berechne_cluster(maske)
             try:
                 # Umrisse aller (auch mehrerer getrennter) Cluster in einem
@@ -3581,6 +3715,7 @@ class LaborApp(ctk.CTk):
             "filter": [dict(f) for f in SEM_FILTER_STANDARD_LISTE],
             "normieren": True,
             "cluster_anzeigen": True,
+            "kleine_cluster_ausblenden": False,
             "mikrometer_pro_pixel": 0.84427,
         }
         zustand = self.lade_rohdaten_filter_einstellungen_fuer_versuch(
@@ -3702,28 +3837,80 @@ class LaborApp(ctk.CTk):
         # Cursor herum), damit man Ausgangsbild und gefiltertes Bild
         # gemeinsam vergleichend reinzoomen kann. Ohne gedrueckte Strg-Taste
         # passiert nichts, damit normales Scrollen der Seite nicht gestoert wird. ---
-        def _strg_gedrueckt(event):
+        def _strg_taste_gedrueckt(event):
+            """
+            Robuste Erkennung, ob Strg/Ctrl/Cmd bei Scroll-Event gedrueckt war.
+            Unterstuetzt mehrere Event-Systeme mit Fallbacks:
+            - tkinter: guiEvent.state & 0x0004
+            - wxPython: event.ControlDown()
+            - Qt: event.modifiers() & Qt.ControlModifier
+            - Generisch: event.key String-Analyse
+            """
+            # Methode 1: tkinter guiEvent.state
             gui_event = getattr(event, "guiEvent", None)
-            zustand_bits = getattr(gui_event, "state", 0)
-            try:
-                return bool(int(zustand_bits) & 0x0004)
-            except (TypeError, ValueError):
-                return False
+            if gui_event is not None:
+                zustand_bits = getattr(gui_event, "state", 0)
+                try:
+                    if bool(int(zustand_bits) & 0x0004):  # Strg-Taste unter tkinter
+                        return True
+                except (TypeError, ValueError):
+                    pass
+            
+            # Methode 2: wxPython
+            if hasattr(event, "ControlDown"):
+                try:
+                    if event.ControlDown():
+                        return True
+                except Exception:
+                    pass
+            
+            # Methode 3: Qt
+            if hasattr(event, "modifiers"):
+                try:
+                    # Versuche Qt zu importieren, falls verfuegbar
+                    try:
+                        from matplotlib.backends.qt_compat import QtCore
+                        if event.modifiers() & QtCore.Qt.ControlModifier:
+                            return True
+                    except ImportError:
+                        pass
+                except Exception:
+                    pass
+            
+            # Methode 4: event.key String-Analyse (manche Matplotlib-Versionen)
+            key = getattr(event, "key", None)
+            if key is not None and "control" in str(key).lower():
+                return True
+            
+            return False
 
         def _synchroner_zoom(event):
             ziel_achse = event.inaxes
-            if ziel_achse not in achsen or not _strg_gedrueckt(event):
+            if ziel_achse not in achsen:
                 return
+            
+            # Robuste Strg-Taste-Erkennung (mit Fallbacks fuer verschiedene Systeme)
+            if not _strg_taste_gedrueckt(event):
+                return
+            
             if event.button == "up":
-                faktor = 0.85
+                faktor = 0.85  # Vergroessern (Hineinzoomen)
             elif event.button == "down":
-                faktor = 1.0 / 0.85
+                faktor = 1.0 / 0.85  # Verkleinern (Herauszoomen)
             else:
                 return
+            
             xlim0, ylim0 = ziel_achse.get_xlim(), ziel_achse.get_ylim()
             breite0, hoehe0 = xlim0[1] - xlim0[0], ylim0[1] - ylim0[0]
-            rel_x = (event.xdata - xlim0[0]) / breite0 if breite0 else 0.5
-            rel_y = (event.ydata - ylim0[0]) / hoehe0 if hoehe0 else 0.5
+            
+            # Relative Position der Maus in der Achse (0.0 - 1.0)
+            if event.xdata is not None and event.ydata is not None:
+                rel_x = (event.xdata - xlim0[0]) / breite0 if breite0 else 0.5
+                rel_y = (event.ydata - ylim0[0]) / hoehe0 if hoehe0 else 0.5
+            else:
+                rel_x, rel_y = 0.5, 0.5
+            
+            # Zoom auf BEIDEN Achsen synchron anwenden
             for achse in achsen:
                 xlim, ylim = achse.get_xlim(), achse.get_ylim()
                 neue_breite = (xlim[1] - xlim[0]) * faktor
@@ -3735,6 +3922,12 @@ class LaborApp(ctk.CTk):
             canvas.draw_idle()
 
         canvas.mpl_connect("scroll_event", _synchroner_zoom)
+
+        # --- Gedrueckt gehaltenes Scroll-Rad: Kartenausschnitt verschieben;
+        # Doppelklick auf dem Scroll-Rad: Zoom zuruecksetzen (siehe
+        # _sem_aktiviere_scrollrad_pan). Beide Achsen (Ausgangsbild +
+        # gefiltertes Bild) wandern dabei synchron mit. ---
+        self._sem_aktiviere_scrollrad_pan(canvas, achsen, toolbar)
 
         def _werte_am_pixel(x, y):
             karten = aktuelle_daten["karten_normiert"]
@@ -3860,9 +4053,53 @@ class LaborApp(ctk.CTk):
         # Durchschnitts-Elementaranalyse ueber die Auswahl. Unterschieden
         # wird per Maus-runter/-bewegt/-los statt nur einem einzelnen
         # Klick-Event, damit ein kurzer Klick weiterhin wie bisher einen
-        # Punkt setzt, ein Ziehen aber die neue Rechteck-Auswahl ausloest. ---
+        # Punkt setzt, ein Ziehen aber die neue Rechteck-Auswahl ausloest.
+        # RECHTSKLICK auf kleine Cluster: entfernt isolierte Cluster automatisch ---
         auswahl = {"aktiv": False, "achse": None, "start_data": None, "start_disp": None, "vorschau": None}
         ZIEH_SCHWELLE_PX = 6  # Mindestbewegung in Bildschirm-Pixeln fuer "Ziehen" statt "Klick"
+        
+        # Maus-basiertes Cluster-Ausblenden: Rechtsklick auf kleine Cluster
+        def _rechtsklick_cluster_ausblenden(event):
+            """Rechtsklick auf kleine Cluster entfernt diese automatisch"""
+            if event.button != 3:  # Button 3 = Rechtsklick
+                return
+            if event.inaxes not in achsen or event.xdata is None or event.ydata is None:
+                return
+            
+            # Pixel an dieser Position ermitteln
+            karten = aktuelle_daten["karten_normiert"]
+            if not karten:
+                return
+            beispiel = next(iter(karten.values()))
+            x, y = int(round(event.xdata)), int(round(event.ydata))
+            if not (0 <= y < beispiel.shape[0] and 0 <= x < beispiel.shape[1]):
+                return
+            
+            # Cluster-Label an dieser Position finden
+            maske = zustand.get("_aktuelle_maske")
+            if maske is None:
+                return
+            
+            labels, anzahl_cluster = self._sem_berechne_cluster(maske)
+            if labels is None or anzahl_cluster == 0:
+                return
+            
+            cluster_label = labels[y, x]
+            if cluster_label == 0:  # Kein Cluster an dieser Position
+                return
+            
+            # Größe dieses Clusters prüfen
+            groessen = (labels == cluster_label).sum()
+            if groessen >= 3:
+                # Nicht klein genug - nicht entfernen
+                return
+            
+            # KLEINE CLUSTER ENTFERNEN: Maske updaten
+            kleine_cluster_var.set(True)  # Checkbox aktivieren
+            zustand["kleine_cluster_ausblenden"] = True
+            
+            # Neu zeichnen
+            zeichne()
 
         def _auswahl_vorschau_entfernen():
             if auswahl["vorschau"] is not None:
@@ -3958,6 +4195,7 @@ class LaborApp(ctk.CTk):
         canvas.mpl_connect("button_press_event", _maus_runter)
         canvas.mpl_connect("motion_notify_event", _maus_bewegt)
         canvas.mpl_connect("button_release_event", _maus_los)
+        canvas.mpl_connect("button_press_event", _rechtsklick_cluster_ausblenden)
         canvas.mpl_connect("key_press_event", _bei_taste)
 
         # --- Rechts: Filter-Sektion (dynamische Liste) + Normierung/Cluster ---
@@ -4142,12 +4380,23 @@ class LaborApp(ctk.CTk):
         ctk.CTkCheckBox(
             rechte_spalte, text="Umrisse via Clusteralgorithmus anzeigen",
             variable=cluster_var,
-        ).pack(fill="x", padx=10, pady=(0, 15))
+        ).pack(fill="x", padx=10, pady=(0, 4))
+
+        # Kleine Cluster ausblenden: untergeordnete Checkbox unter Cluster-Umrisse
+        kleine_cluster_var = ctk.BooleanVar(value=zustand.get("kleine_cluster_ausblenden", False))
+        kleine_cluster_checkbox = ctk.CTkCheckBox(
+            rechte_spalte, text="kleine Cluster ausblenden (< 3 px, isoliert)",
+            variable=kleine_cluster_var,
+        )
+        kleine_cluster_checkbox.pack(fill="x", padx=30, pady=(0, 15))
+        # Hinweis: padx=30 rueckt diese Checkbox 20 Pixel weiter nach rechts ein,
+        # um sie visuell als Unteroption der "Cluster-Umrisse"-Checkbox zu kennzeichnen
 
         def uebernehmen():
             _uebernimm_zeilen_in_zustand()
             zustand["normieren"] = bool(normieren_var.get())
             zustand["cluster_anzeigen"] = bool(cluster_var.get())
+            zustand["kleine_cluster_ausblenden"] = bool(kleine_cluster_var.get())
             pfad = ausgewaehlter_pfad["wert"]
             if pfad:
                 self.speichere_rohdaten_filter_einstellungen_fuer_versuch(
@@ -4167,6 +4416,7 @@ class LaborApp(ctk.CTk):
             _uebernimm_zeilen_in_zustand()
             zustand["normieren"] = bool(normieren_var.get())
             zustand["cluster_anzeigen"] = bool(cluster_var.get())
+            zustand["kleine_cluster_ausblenden"] = bool(kleine_cluster_var.get())
             alle_schluessel = [
                 self.versuch_schluessel_rohdaten_filter(projekt, voller_pfad)
                 for _staub, _eintrag, voller_pfad in versuche
@@ -4177,6 +4427,7 @@ class LaborApp(ctk.CTk):
         def _aktualisiere_filter_panel_impl():
             normieren_var.set(zustand.get("normieren", True))
             cluster_var.set(zustand.get("cluster_anzeigen", True))
+            kleine_cluster_var.set(zustand.get("kleine_cluster_ausblenden", False))
             baue_filter_zeilen()
 
         aktualisiere_filter_panel["fn"] = _aktualisiere_filter_panel_impl
@@ -5137,16 +5388,21 @@ class LaborApp(ctk.CTk):
         zusammen mit `probe_maske`, falls `pixel_maske` fehlt - auch fuer
         die Berechnung von x_min/x_max verwendet.
 
-        Gibt (rgb_bild, x_min, x_max) zurueck; x_min/x_max sind ECHTE
-        Element-Prozentwerte (0-100) und werden fuer die Farbskalen-Legende
-        (Colorbar) im Diagramm gebraucht. Bei leerer/konstanter Karte:
-        (None, 0.0, 0.0).
+        Gibt (rgb_bild, x_min, x_max, x_max_linear) zurueck; x_min/x_max/
+        x_max_linear sind ECHTE Element-Prozentwerte (0-100) und werden fuer
+        die Farbskalen-Legende (Colorbar) im Diagramm gebraucht. x_max_linear
+        ist IMMER das tatsaechliche Maximum innerhalb der Probe (unabhaengig
+        vom gewaehlten Modus) - im "p99"-Modus braucht die Colorbar diesen
+        Wert zusaetzlich zu x_max (= p99-Wert) fuer die Anzeige oberhalb der
+        Unterbrechung (siehe baue_ergebnisse_tab_sem/zeichne). Im "linear"-
+        Modus ist x_max_linear == x_max. Bei leerer/konstanter Karte:
+        (None, 0.0, 0.0, 0.0).
         """
         import numpy as np
         import matplotlib as mpl
 
         if karte is None or karte.size == 0:
-            return None, 0.0, 0.0
+            return None, 0.0, 0.0, 0.0
 
         prozent_karte = karten_prozent.get(element) if karten_prozent else None
         # Fallback auf die rohen Grauwerte, falls (aus irgendeinem Grund)
@@ -5162,12 +5418,15 @@ class LaborApp(ctk.CTk):
             werte_in_probe = basis_karte.reshape(-1)
 
         x_min = float(np.min(werte_in_probe))
+        x_max_linear = float(np.max(werte_in_probe))
         if zustand.get("farbskalierung", "p99") == "linear":
-            x_max = float(np.max(werte_in_probe))
+            x_max = x_max_linear
         else:
             x_max = float(np.percentile(werte_in_probe, 99))
         if x_max <= x_min:
             x_max = x_min + 1.0
+        if x_max_linear <= x_min:
+            x_max_linear = x_min + 1.0
 
         normiert = np.clip((basis_karte - x_min) / (x_max - x_min), 0.0, 1.0)
 
@@ -5181,7 +5440,7 @@ class LaborApp(ctk.CTk):
         if pixel_maske is not None and pixel_maske.shape == karte.shape:
             rgb_bild[~pixel_maske] = 1.0
 
-        return rgb_bild, x_min, x_max
+        return rgb_bild, x_min, x_max, x_max_linear
 
     def baue_ergebnisse_tab_sem(self, parent, projekt, methode):
         """
@@ -5202,6 +5461,7 @@ class LaborApp(ctk.CTk):
             return
 
         try:
+            import matplotlib as mpl
             import matplotlib.pyplot as plt
             import matplotlib.patches as mpatches
             import matplotlib.cm as mcm
@@ -5397,10 +5657,12 @@ class LaborApp(ctk.CTk):
         canvas = FigureCanvasTkAgg(fig, master=mitte)
         canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
 
-        # Merkt sich die Colorbar-Achse der Farbskalen-Legende zwischen
+        # Merkt sich die Colorbar-Achse(n) der Farbskalen-Legende zwischen
         # zwei zeichne()-Aufrufen, damit sie vor jedem Neuzeichnen sauber
-        # entfernt wird (statt sich bei jedem Aufruf zu verdoppeln).
-        farbskala_status = {"cax": None}
+        # entfernt werden (statt sich bei jedem Aufruf zu verdoppeln). Im
+        # p99-Modus sind es ZWEI Achsen (Hauptskala + kleines Segment fuer
+        # den echten Maximalwert oberhalb der Unterbrechung, siehe zeichne()).
+        farbskala_status = {"achsen": []}
 
         toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
         toolbar.update()
@@ -5647,6 +5909,11 @@ class LaborApp(ctk.CTk):
 
         canvas.mpl_connect("scroll_event", _strg_scroll_zoom)
 
+        # --- Gedrueckt gehaltenes Scroll-Rad: Kartenausschnitt verschieben;
+        # Doppelklick auf dem Scroll-Rad: Zoom zuruecksetzen (siehe
+        # _sem_aktiviere_scrollrad_pan). ---
+        self._sem_aktiviere_scrollrad_pan(canvas, (ax,), toolbar)
+
         def zeichne(zoom_beibehalten=True):
             pfad = ausgewaehlter_pfad["wert"]
             # Zoom-Ausschnitt IMMER frisch direkt vom Diagramm lesen (nicht
@@ -5731,17 +5998,17 @@ class LaborApp(ctk.CTk):
                     aktives_element = next(iter(elementkarten.keys()))
                 zustand["ausgewaehltes_element"] = aktives_element
 
-            # Vorherige Colorbar-Achse entfernen, bevor eine neue gezeichnet
-            # wird - sonst haeufen sich bei jedem zeichne()-Aufruf weitere
+            # Vorherige Colorbar-Achse(n) entfernen, bevor neue gezeichnet
+            # werden - sonst haeufen sich bei jedem zeichne()-Aufruf weitere
             # Colorbars an.
-            if farbskala_status["cax"] is not None:
+            for _alte_achse in farbskala_status["achsen"]:
                 try:
-                    farbskala_status["cax"].remove()
+                    _alte_achse.remove()
                 except Exception:
                     pass
-                farbskala_status["cax"] = None
+            farbskala_status["achsen"] = []
 
-            bild, x_min, x_max = self._sem_baue_element_farbbild(
+            bild, x_min, x_max, x_max_linear = self._sem_baue_element_farbbild(
                 elementkarten[aktives_element], aktives_element, zustand,
                 karten_prozent=karten_prozent, pixel_maske=pixel_maske, probe_maske=probe_maske,
             )
@@ -5760,29 +6027,124 @@ class LaborApp(ctk.CTk):
                 # INNERHALB DER PROBE beschraenkt - im Linear-Modus steht
                 # so oben an der Skala genau der hoechste in der Probe
                 # vorkommende %-Wert dieses Elements. ---
-                divider = make_axes_locatable(ax)
-                cax = divider.append_axes("right", size="4%", pad=0.12)
-                mappable = mcm.ScalarMappable(
-                    norm=Normalize(vmin=x_min, vmax=x_max), cmap=SEM_FARBSKALA_COLORMAP
-                )
-                colorbar = fig.colorbar(mappable, cax=cax)
                 skalierungs_label = SEM_FARBSKALIERUNG_LABELS.get(
                     zustand.get("farbskalierung", "p99"), "p99"
                 )
-                colorbar.set_label(f"{aktives_element}-Anteil in % – {skalierungs_label}", fontsize=9)
-                # WICHTIG: matplotlib waehlt die Tick-Positionen sonst
-                # automatisch "rund" (z.B. 0/10/20/...%) - der hoechste
-                # tatsaechlich vorkommende Wert (x_max) landet dadurch
-                # meist NICHT direkt am oberen Rand der Skala, sondern
-                # etwas darunter. Hier stattdessen ein festes Set von
-                # Ticks setzen, das x_min UND x_max garantiert einschliesst
-                # -> der hoechste Wert steht immer ganz oben mit eigener
-                # Beschriftung.
-                ticks = np.linspace(x_min, x_max, 6)
-                colorbar.set_ticks(ticks)
-                colorbar.ax.yaxis.set_major_formatter(PercentFormatter())
-                colorbar.ax.tick_params(labelsize=8)
-                farbskala_status["cax"] = cax
+                divider = make_axes_locatable(ax)
+                platzhalter_cax = divider.append_axes("right", size="4%", pad=0.12)
+
+                ist_p99 = zustand.get("farbskalierung", "p99") == "p99" and x_max_linear > x_max
+                if not ist_p99:
+                    # --- Normalfall (Linear-Modus, oder p99 ohne
+                    # abgeschnittene Ausreisser): EINE durchgehende
+                    # Colorbar wie bisher. ---
+                    mappable = mcm.ScalarMappable(
+                        norm=Normalize(vmin=x_min, vmax=x_max), cmap=SEM_FARBSKALA_COLORMAP
+                    )
+                    colorbar = fig.colorbar(mappable, cax=platzhalter_cax)
+                    colorbar.set_label(f"{aktives_element}-Anteil in % – {skalierungs_label}", fontsize=9)
+                    # WICHTIG: matplotlib waehlt die Tick-Positionen sonst
+                    # automatisch "rund" (z.B. 0/10/20/...%) - der hoechste
+                    # tatsaechlich vorkommende Wert (x_max) landet dadurch
+                    # meist NICHT direkt am oberen Rand der Skala, sondern
+                    # etwas darunter. Hier stattdessen ein festes Set von
+                    # Ticks setzen, das x_min UND x_max garantiert
+                    # einschliesst -> der hoechste Wert steht immer ganz
+                    # oben mit eigener Beschriftung.
+                    ticks = np.linspace(x_min, x_max, 6)
+                    colorbar.set_ticks(ticks)
+                    colorbar.ax.yaxis.set_major_formatter(PercentFormatter())
+                    colorbar.ax.tick_params(labelsize=8)
+                    farbskala_status["achsen"] = [platzhalter_cax]
+                else:
+                    # --- p99-Modus MIT abgeschnittenen Ausreissern:
+                    # unterbrochene Colorbar. Unten (Hauptteil) die normale,
+                    # p99-skalierte Farbskala (0 bis p99-Wert) - deren
+                    # oberer Rand ist automatisch bereits die Endfarbe der
+                    # Colormap. Oben (kleines Segment, gleiche Endfarbe)
+                    # steht NUR der tatsaechliche lineare Maximalwert.
+                    # Dazwischen ein sichtbarer "Bruch" (Unterbrechung), wie
+                    # bei einer klassischen unterbrochenen Achse. Vor und
+                    # nach der Unterbrechung hat die Skala dieselbe Farbe
+                    # (die Endfarbe der Colormap). ---
+                    # WICHTIG: get_position() sofort nach append_axes()
+                    # liefert eine falsche (viel zu grosse/verschobene)
+                    # Bbox - der AxesDivider berechnet die tatsaechliche,
+                    # schmale Position von platzhalter_cax erst waehrend
+                    # eines Layout-/Zeichen-Durchlaufs. Deshalb hier zuerst
+                    # einen Layout-Durchlauf erzwingen (ohne sichtbares
+                    # Zeichnen), damit platz_bbox die ECHTE, schmale
+                    # Position/Breite der reservierten Colorbar-Flaeche
+                    # enthaelt - sonst landet die Skala viel zu breit und zu
+                    # weit links (fast ueber dem ganzen Diagramm) statt als
+                    # duenner Streifen ganz rechts.
+                    try:
+                        fig.draw_without_rendering()
+                    except AttributeError:
+                        fig.canvas.draw()
+                    platz_bbox = platzhalter_cax.get_position()
+                    platzhalter_cax.remove()
+
+                    oben_anteil = 0.07   # Hoehenanteil des kleinen Max-Segments
+                    luecke_anteil = 0.035  # Hoehenanteil der sichtbaren Unterbrechung
+                    haupt_anteil = 1.0 - oben_anteil - luecke_anteil
+
+                    haupt_hoehe = platz_bbox.height * haupt_anteil
+                    oben_hoehe = platz_bbox.height * oben_anteil
+                    haupt_cax = fig.add_axes([
+                        platz_bbox.x0, platz_bbox.y0, platz_bbox.width, haupt_hoehe,
+                    ])
+                    oben_cax = fig.add_axes([
+                        platz_bbox.x0, platz_bbox.y0 + platz_bbox.height - oben_hoehe,
+                        platz_bbox.width, oben_hoehe,
+                    ])
+                    # Aus dem tight_layout()-Management ausnehmen - sonst
+                    # wuerde der spaetere fig.tight_layout()-Aufruf die hier
+                    # bewusst berechnete Position/Groesse wieder verwerfen.
+                    haupt_cax.set_in_layout(False)
+                    oben_cax.set_in_layout(False)
+
+                    # Hauptteil: normale p99-Colorbar (x_min bis x_max=p99).
+                    mappable = mcm.ScalarMappable(
+                        norm=Normalize(vmin=x_min, vmax=x_max), cmap=SEM_FARBSKALA_COLORMAP
+                    )
+                    colorbar = fig.colorbar(mappable, cax=haupt_cax)
+                    colorbar.set_label(f"{aktives_element}-Anteil in % – {skalierungs_label}", fontsize=9)
+                    ticks = np.linspace(x_min, x_max, 6)
+                    colorbar.set_ticks(ticks)
+                    colorbar.ax.yaxis.set_major_formatter(PercentFormatter())
+                    colorbar.ax.tick_params(labelsize=8)
+
+                    # Oberes Segment: durchgehend die Endfarbe der Colormap
+                    # (dieselbe Farbe wie am oberen Rand des Hauptteils) -
+                    # zeigt NUR den echten linearen Maximalwert als
+                    # Beschriftung ganz oben.
+                    endfarbe = mpl.colormaps[SEM_FARBSKALA_COLORMAP](1.0)
+                    oben_cax.set_facecolor(endfarbe)
+                    oben_cax.set_xticks([])
+                    oben_cax.set_xlim(0, 1)
+                    oben_cax.set_ylim(0, 1)
+                    oben_cax.yaxis.tick_right()
+                    oben_cax.set_yticks([1.0])
+                    oben_cax.set_yticklabels([f"{x_max_linear:.1f}%"])
+                    oben_cax.tick_params(labelsize=8, length=0)
+                    for spine in oben_cax.spines.values():
+                        spine.set_visible(True)
+                        spine.set_edgecolor("black")
+                        spine.set_linewidth(0.8)
+
+                    # Sichtbare Unterbrechung: klassische diagonale
+                    # "Bruch"-Striche an der Unterkante des oberen und der
+                    # Oberkante des unteren Segments (Standard-Notation fuer
+                    # eine unterbrochene Achse/Skala).
+                    bruch_kwargs = dict(
+                        marker=[(-1, -0.6), (1, 0.6)], markersize=9, linestyle="none",
+                        color="black", mec="black", mew=1.1, clip_on=False,
+                    )
+                    oben_cax.plot([0, 1], [0, 0], transform=oben_cax.transAxes, **bruch_kwargs)
+                    haupt_cax.plot([0, 1], [1, 1], transform=haupt_cax.transAxes, **bruch_kwargs)
+
+                    farbskala_status["achsen"] = [haupt_cax, oben_cax]
             ax.set_title(f"{os.path.splitext(os.path.basename(pfad))[0]}  –  Element: {aktives_element}")
 
             # --- Markierungen: kleiner nummerierter Kreis am Pixel (einzelner

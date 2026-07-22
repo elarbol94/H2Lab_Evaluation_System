@@ -3374,14 +3374,52 @@ class LaborApp(ctk.CTk):
         canvas.mpl_connect("motion_notify_event", _mittlere_maus_bewegt)
         canvas.mpl_connect("button_release_event", _mittlere_maus_los)
 
+    # Stufen fuer die automatische Wahl einer "schoenen" Balkenlaenge (1-2-5-
+    # Folge in µm), falls die feste Standardlaenge (MASSSTABSBALKEN_LAENGE_UM)
+    # beim Reinzoomen nicht mehr in den sichtbaren Ausschnitt passen wuerde.
+    _SEM_MASSSTAB_STUFEN_UM = [
+        1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000,
+    ]
+
+    def _sem_waehle_massstab_laenge_um(self, sichtbare_breite_um):
+        """Waehlt eine sinnvolle Balkenlaenge (µm) fuer den AKTUELL
+        sichtbaren Ausschnitt: die feste Standardlaenge
+        (MASSSTABSBALKEN_LAENGE_UM), SOLANGE sie noch bequem in den
+        Ausschnitt passt (<= 60% der sichtbaren Breite) - ist beim
+        Reinzoomen kein Platz mehr dafuer, wird automatisch die naechst-
+        kleinere "schoene" 1-2-5-Stufe gewaehlt, die ca. 15-30% der
+        sichtbaren Breite einnimmt. So bleibt der Balken bei JEDEM Zoom-
+        Level sichtbar (anders als vorher, wo eine feste Pixel-Laenge beim
+        Reinzoomen irgendwann ueber den sichtbaren Bereich hinausragte)."""
+        if sichtbare_breite_um <= 0:
+            return self.MASSSTABSBALKEN_LAENGE_UM
+        standard = self.MASSSTABSBALKEN_LAENGE_UM
+        if standard <= sichtbare_breite_um * 0.6:
+            return standard
+        ziel = sichtbare_breite_um * 0.28
+        kandidaten = [v for v in self._SEM_MASSSTAB_STUFEN_UM if v <= ziel]
+        if kandidaten:
+            return max(kandidaten)
+        return min(self._SEM_MASSSTAB_STUFEN_UM)
+
     def _sem_aktualisiere_massstabsbalken(self, ax, um_pro_px):
         """
-        Zeichnet/aktualisiert den Maßstabsbalken in `ax` mit einer FESTEN
-        Länge von MASSSTABSBALKEN_LAENGE_UM (Standard: 1000 µm), umgerechnet
-        über die Kalibrierung `um_pro_px` (Mikrometer/Pixel, Standard:
-        0.84427 µm/Pixel, vom Nutzer editierbar im Rohdaten-Tab) in die
-        entsprechende Pixel-Breite. Bei um_pro_px <= 0 wird nur der
-        vorherige Balken entfernt.
+        Zeichnet/aktualisiert den Maßstabsbalken fuer `ax`. Der Balken sitzt
+        AUSSERHALB der eigentlichen Bildflaeche (leicht unterhalb, in
+        Achsen-relativen Koordinaten mit clip_on=False) statt wie frueher
+        als Datenkoordinaten-Linie MITTEN IM Bild - so verdeckt er keine
+        Pixel und bleibt beim Reinzoomen sichtbar, weil er nicht mehr Teil
+        des (dann u.U. weit hineingezoomten) Datenausschnitts ist.
+
+        Die dargestellte Laenge passt sich dem aktuellen Zoom an (siehe
+        _sem_waehle_massstab_laenge_um): bevorzugt die feste Standardlaenge
+        (MASSSTABSBALKEN_LAENGE_UM), bei starkem Reinzoomen automatisch eine
+        kleinere "schoene" Stufe, damit der Balken nie breiter als der
+        sichtbare Ausschnitt (und damit unsichtbar) wird.
+
+        Wird per xlim_changed/ylim_changed-Callback (siehe
+        _sem_registriere_massstab_auto_update) bei JEDEM Zoom/Pan automatisch
+        erneut aufgerufen - nicht nur beim vollstaendigen Neuzeichnen.
 
         Vorherige Balken-Elemente (Linie + Text) werden VOR dem Neuzeichnen
         entfernt (in ax._sem_massstab_artists zwischengespeichert) - sonst
@@ -3394,61 +3432,71 @@ class LaborApp(ctk.CTk):
             except Exception:
                 pass
         ax._sem_massstab_artists = []
+        # Fuer den Auto-Update-Callback (siehe _sem_registriere_massstab_auto_update)
+        # merken, mit welcher Kalibrierung dieser Balken zuletzt gezeichnet wurde.
+        ax._sem_um_pro_px = um_pro_px
 
         if not um_pro_px or um_pro_px <= 0:
             return
 
         xlim, ylim = ax.get_xlim(), ax.get_ylim()
         sichtbare_breite_px = abs(xlim[1] - xlim[0])
-        sichtbare_hoehe_px = abs(ylim[1] - ylim[0])
         if sichtbare_breite_px <= 0:
             return
+        sichtbare_breite_um = sichtbare_breite_px * um_pro_px
 
-        # Feste Balkenlaenge von 1000 Mikrometer (statt automatisch
-        # gewaehlter "schoener" Rundungszahl basierend auf dem sichtbaren
-        # Ausschnitt). Bei Bedarf ueber MASSSTABSBALKEN_LAENGE_UM anpassbar.
-        #
-        # === MASSTABSBALKEN-BERECHNUNG (nach Dokumentation - Schritt 6) ===
-        # Gewünschte Länge: 1000 µm (= 1 mm)
-        # Pixelgröße: 0.84427 µm/Pixel (aus H5OINA oder manuell)
-        # Berechnung: balken_px = balken_um / um_pro_px
-        #            balken_px = 1000 µm / 0.84427 µm/Pixel
-        #            balken_px ≈ 1184.45 Pixel
-        balken_px, balken_um = self._sem_berechne_massstabsbalken_pixel(um_pro_px)
-        if balken_px is None or balken_um is None:
-            return
+        balken_um = self._sem_waehle_massstab_laenge_um(sichtbare_breite_um)
+        balken_anteil = balken_um / sichtbare_breite_um  # Balkenlaenge als Anteil der Achsenbreite (0-1)
 
-        x_min = min(xlim)
-        rand_x = x_min + sichtbare_breite_px * 0.05
-        rand_y = sichtbare_hoehe_px * 0.08
-        # Bei imshow ist die y-Achse i.d.R. invertiert (0 oben, Bildhoehe
-        # unten) - "unten im Bild" liegt dann bei max(ylim), sonst bei
-        # min(ylim). Balken + Beschriftung entsprechend dazu ausrichten.
-        invertiert = ylim[0] > ylim[1]
-        if invertiert:
-            y_balken = max(ylim) - rand_y
-            text_y = y_balken - sichtbare_hoehe_px * 0.025
-            va = "bottom"
-        else:
-            y_balken = min(ylim) + rand_y
-            text_y = y_balken + sichtbare_hoehe_px * 0.025
-            va = "top"
+        # Position: unterhalb der Bildflaeche, in Achsen-relativen Koordinaten
+        # (0,0)=unten-links / (1,1)=oben-rechts der Achse, UNABHAENGIG vom
+        # aktuellen Zoom - clip_on=False laesst die Zeichnung trotz Lage
+        # ausserhalb der eigentlichen Achsenflaeche zu.
+        rand_x = 0.02
+        y_balken = -0.06
+        y_text = -0.10
 
-        linie, = ax.plot(
-            [rand_x, rand_x + balken_px], [y_balken, y_balken],
-            color="black", linewidth=3, solid_capstyle="butt", zorder=5,
+        from matplotlib.lines import Line2D
+
+        linie = Line2D(
+            [rand_x, rand_x + balken_anteil], [y_balken, y_balken],
+            transform=ax.transAxes, color="black", linewidth=3,
+            solid_capstyle="butt", zorder=5, clip_on=False,
         )
+        ax.add_line(linie)
         beschriftung = (
             f"{balken_um / 1000:g} mm"
             if balken_um >= 1000 and balken_um % 1000 == 0
             else f"{balken_um:g} µm"
         )
         text = ax.text(
-            rand_x + balken_px / 2, text_y, beschriftung,
-            color="black", fontsize=9, fontweight="bold", ha="center", va=va, zorder=5,
-            path_effects=self._sem_massstab_texteffekt(),
+            rand_x + balken_anteil / 2, y_text, beschriftung,
+            transform=ax.transAxes, color="black", fontsize=9, fontweight="bold",
+            ha="center", va="top", zorder=5, clip_on=False,
         )
         ax._sem_massstab_artists = [linie, text]
+
+    def _sem_registriere_massstab_auto_update(self, ax, um_pro_px):
+        """Verbindet (einmalig, alte Verbindung wird vorher getrennt) einen
+        xlim_changed/ylim_changed-Callback auf `ax`, der den Maßstabsbalken
+        bei JEDEM Zoom/Pan (Mausrad, Toolbar-Lupe, Ziehen, Zoom-per-Klick,
+        Wiederherstellen eines gemerkten Zoom-Ausschnitts, ...) automatisch
+        neu mit der aktuell sichtbaren Breite berechnet - sonst wuerde der
+        Balken nur beim vollstaendigen Neuzeichnen stimmen und bei reinem
+        Zoomen/Pannen (ohne Neuzeichnen) falsch/unsichtbar bleiben."""
+        for alter_cid in getattr(ax, "_sem_massstab_cids", []):
+            try:
+                ax.callbacks.disconnect(alter_cid)
+            except Exception:
+                pass
+
+        def _bei_limit_aenderung(_achse):
+            self._sem_aktualisiere_massstabsbalken(_achse, getattr(_achse, "_sem_um_pro_px", None))
+
+        cid_x = ax.callbacks.connect("xlim_changed", _bei_limit_aenderung)
+        cid_y = ax.callbacks.connect("ylim_changed", _bei_limit_aenderung)
+        ax._sem_massstab_cids = [cid_x, cid_y]
+        self._sem_aktualisiere_massstabsbalken(ax, um_pro_px)
 
     def _sem_berechne_massstabsbalken_pixel(self, um_pro_px):
         """
@@ -3676,9 +3724,18 @@ class LaborApp(ctk.CTk):
             # merken (siehe _on_press/_vollansicht_setzen in
             # baue_rohdaten_tab_sem).
             ax_massstab._sem_vollansicht = (ax_massstab.get_xlim(), ax_massstab.get_ylim())
-            self._sem_aktualisiere_massstabsbalken(ax_massstab, achsen_um_pro_px)
+            # registriere_massstab_auto_update (statt nur einmalig
+            # aktualisieren) haengt zusaetzlich einen xlim/ylim_changed-
+            # Callback ein, der den Balken bei JEDEM Zoom/Pan (Strg+Mausrad,
+            # Toolbar-Lupe, Ziehen, ...) automatisch neu berechnet - sonst
+            # bleibt er nur beim vollstaendigen Neuzeichnen korrekt und
+            # verschwindet/stimmt beim reinen Zoomen nicht mehr.
+            self._sem_registriere_massstab_auto_update(ax_massstab, achsen_um_pro_px)
 
-        fig.tight_layout()
+        # Etwas Platz UNTER den Achsen reservieren, damit der (bewusst
+        # ausserhalb der Bildflaeche liegende) Maßstabsbalken samt
+        # Beschriftung nicht vom Figure-Rand abgeschnitten wird.
+        fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
         canvas.draw()
 
     def baue_rohdaten_tab_sem(self, parent, projekt, methode):
@@ -3775,9 +3832,10 @@ class LaborApp(ctk.CTk):
                 zustand["filter"] = [dict(f) for f in SEM_FILTER_STANDARD_LISTE]
             zustand["filter"] = self._sem_normalisiere_filter_liste(zustand["filter"])
             markierungen.clear()
+            bild_status["gezeichnet"] = False
             if aktualisiere_filter_panel["fn"]:
                 aktualisiere_filter_panel["fn"]()
-            zeichne()
+            zeichne(zoom_beibehalten=False)
 
         for _staub, eintrag, voller_pfad in versuche:
             zeile = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -3812,12 +3870,29 @@ class LaborApp(ctk.CTk):
 
         aktuelle_daten = {"karten_normiert": None}
         markierungen = []
+        bild_status = {"gezeichnet": False}
 
-        def zeichne():
+        def zeichne(zoom_beibehalten=True):
             pfad = ausgewaehlter_pfad["wert"]
             if not pfad:
                 return
+            # Aktuellen Zoom-Ausschnitt VOR dem Neuzeichnen merken (analog
+            # zum Ergebnisse-Tab) - sonst wuerde jeder Klick auf ein Pixel
+            # (der zeichne() erneut aufruft) den Zoom auf die Vollansicht
+            # zuruecksetzen, weil zeichne_rohdaten_vorschau_sem() die Achsen
+            # per ax.clear() komplett neu aufbaut.
+            kann_zoom_erhalten = zoom_beibehalten and bild_status["gezeichnet"]
+            vorherige_xlim = [a.get_xlim() if kann_zoom_erhalten else None for a in achsen]
+            vorherige_ylim = [a.get_ylim() if kann_zoom_erhalten else None for a in achsen]
             self.zeichne_rohdaten_vorschau_sem(pfad, fig, achsen, canvas, zustand, aktuelle_daten=aktuelle_daten)
+            for achse, xlim, ylim in zip(achsen, vorherige_xlim, vorherige_ylim):
+                if xlim is not None and ylim is not None:
+                    achse.set_xlim(xlim)
+                    achse.set_ylim(ylim)
+                    self._sem_aktualisiere_massstabsbalken(
+                        achse, getattr(achse, "_sem_um_pro_px", None)
+                    )
+            bild_status["gezeichnet"] = True
             _zeichne_markierungen()
             canvas.draw()
             # WICHTIG: "Home"-Knopf (Haus-Symbol) der Toolbar reparieren.
@@ -5663,6 +5738,10 @@ class LaborApp(ctk.CTk):
         # p99-Modus sind es ZWEI Achsen (Hauptskala + kleines Segment fuer
         # den echten Maximalwert oberhalb der Unterbrechung, siehe zeichne()).
         farbskala_status = {"achsen": []}
+        # Zuletzt verwendete µm/Pixel-Kalibrierung (wird in zeichne() gesetzt)
+        # - fuer die Linienbreite des Linien-Auswahlwerkzeugs gebraucht, ohne
+        # dafuer extra die Kalibrierungsdatei erneut lesen zu muessen.
+        kalibrierung_status = {"um_pro_px": None}
 
         toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
         toolbar.update()
@@ -5729,6 +5808,35 @@ class LaborApp(ctk.CTk):
                 (anzeige_xa, anzeige_ya, anzeige_xb, anzeige_yb),
             )
 
+        def _durchschnitt_im_polygon(anzeige_punkte):
+            """Mittelwert jedes Elements ueber ein beliebiges Polygon
+            (fuer Polygon-Auswahl UND die auf ein Rechteck/Kapsel
+            reduzierte Linien-Auswahl - beide nutzen dieselbe Geometrie).
+            `anzeige_punkte`: Liste von (x, y) in Anzeige-Pixelkoordinaten
+            (dieselben wie event.xdata/event.ydata). Wird auf die (kleinere)
+            Aufloesung der Elementkarten herunterskaliert und dort per
+            matplotlib.path.Path rasterisiert - so bleibt das auch bei sehr
+            grossen Anzeigebildern (mehrere tausend Pixel breit) schnell."""
+            karten = aktuelle_daten["karten_normiert"]
+            if not karten or len(anzeige_punkte) < 3:
+                return None
+            from matplotlib.path import Path as _MplPath
+
+            beispiel_karte = next(iter(karten.values()))
+            hoehe_bild, breite_bild = beispiel_karte.shape[0], beispiel_karte.shape[1]
+            anzeige_h, anzeige_w = aktuelle_daten.get("anzeige_shape", beispiel_karte.shape[:2])
+            karten_punkte = [
+                (px * breite_bild / anzeige_w, py * hoehe_bild / anzeige_h)
+                for px, py in anzeige_punkte
+            ]
+            pfad = _MplPath(karten_punkte)
+            xx, yy = np.meshgrid(np.arange(breite_bild), np.arange(hoehe_bild))
+            gitter = np.column_stack((xx.ravel() + 0.5, yy.ravel() + 0.5))
+            innen = pfad.contains_points(gitter).reshape(hoehe_bild, breite_bild)
+            if not innen.any():
+                return None
+            return {element: float(np.mean(karte[innen])) for element, karte in karten.items()}
+
         def _markierung_box_inhalt(marker, index):
             """Zeilen + grobe Box-Groesse (in Punkten) fuer die
             Zusammensetzungs-Box einer Markierung - wird sowohl beim
@@ -5737,8 +5845,13 @@ class LaborApp(ctk.CTk):
             dieselbe Geometrie annehmen."""
             top_werte = sorted(marker["werte"].items(), key=lambda kv: -kv[1])[:5]
             zeilen = [f"{element}: {wert:.1f}%" for element, wert in top_werte if wert >= 0.05]
-            if marker.get("typ") == "rechteck":
+            typ = marker.get("typ")
+            if typ == "rechteck":
                 kopf = f"Ø{index}  ({marker['breite']}×{marker['hoehe']} px)"
+            elif typ == "linie":
+                kopf = f"Ø{index}  (Linie, {marker.get('breite_um', 0):.0f} µm)"
+            elif typ == "polygon":
+                kopf = f"Ø{index}  (Polygon)"
             else:
                 kopf = f"M{index}"
             alle_zeilen = [kopf] + (zeilen if zeilen else ["alle Elemente ~0 %"])
@@ -5767,11 +5880,117 @@ class LaborApp(ctk.CTk):
                     return marker
             return None
 
-        # --- Klick = einzelner Pixel, Ziehen (Rechteck aufziehen) =
-        # Durchschnitts-Elementaranalyse ueber die Auswahl. Unterschieden
-        # wird per Maus-runter/-bewegt/-los statt nur einem einzelnen
-        # Klick-Event, damit ein kurzer Klick weiterhin wie bisher einen
-        # Punkt setzt, ein Ziehen aber die neue Rechteck-Auswahl ausloest. ---
+        # --- Auswahlwerkzeuge: "rechteck"/"linie"/"polygon" (per Knopf im
+        # rechten Panel gewaehlt) oder None (Standard). OHNE aktives
+        # Werkzeug zoomt Ziehen in den aufgezogenen Bereich, statt eine
+        # Markierung zu erzeugen - so bleibt "einfach mit der Maus zoomen"
+        # der Standardfall, waehrend die drei Werkzeuge gezielt fuer die
+        # Durchschnitts-Elementaranalyse aktiviert werden. ---
+        import math as _math
+
+        auswahl_zustand = {"modus": None, "linienbreite_um": 5.0, "polygon_punkte": [], "vorschau_polygon": None}
+
+        def _polygon_vorschau_entfernen():
+            if auswahl_zustand.get("vorschau_polygon") is not None:
+                try:
+                    auswahl_zustand["vorschau_polygon"].remove()
+                except Exception:
+                    pass
+                auswahl_zustand["vorschau_polygon"] = None
+
+        def _setze_werkzeug_modus(neuer_modus):
+            # Erneuter Klick auf das bereits aktive Werkzeug schaltet es
+            # wieder aus (zurueck zum Standard-Zoom-per-Ziehen).
+            if auswahl_zustand["modus"] == neuer_modus:
+                neuer_modus = None
+            auswahl_zustand["modus"] = neuer_modus
+            auswahl_zustand["polygon_punkte"] = []
+            _polygon_vorschau_entfernen()
+            for knopf, m in (
+                (rechteck_werkzeug_btn, "rechteck"),
+                (linie_werkzeug_btn, "linie"),
+                (polygon_werkzeug_btn, "polygon"),
+            ):
+                knopf.configure(fg_color=MUL_TURKIS if m == neuer_modus else "transparent")
+            if neuer_modus == "linie":
+                linienbreite_zeile.pack(fill="x", padx=10, pady=(0, 8))
+            else:
+                linienbreite_zeile.pack_forget()
+            canvas.draw_idle()
+
+        def _linien_eckpunkte(x0, y0, x1, y1):
+            """4 Eckpunkte (Anzeige-Pixelkoordinaten) eines Rechtecks um die
+            gezogene Linie herum, dessen Breite quer zur Linie der im Feld
+            'Linienbreite (µm)' eingestellten Breite entspricht (umgerechnet
+            ueber die aktuelle µm/Pixel-Kalibrierung, siehe kalibrierung_status)."""
+            dx, dy = x1 - x0, y1 - y0
+            laenge = _math.hypot(dx, dy)
+            try:
+                breite_um = float(linienbreite_entry.get().strip().replace(",", "."))
+            except (ValueError, AttributeError):
+                breite_um = auswahl_zustand.get("linienbreite_um", 5.0)
+            if breite_um <= 0:
+                breite_um = auswahl_zustand.get("linienbreite_um", 5.0)
+            auswahl_zustand["linienbreite_um"] = breite_um
+            um_pro_px = kalibrierung_status.get("um_pro_px") or 0.0
+            if um_pro_px > 0:
+                halbe_breite_px = max((breite_um / um_pro_px) / 2.0, 0.5)
+            else:
+                halbe_breite_px = 2.0
+            if laenge > 0:
+                nx, ny = -dy / laenge, dx / laenge
+            else:
+                nx, ny = 0.0, 1.0
+            return [
+                (x0 + nx * halbe_breite_px, y0 + ny * halbe_breite_px),
+                (x1 + nx * halbe_breite_px, y1 + ny * halbe_breite_px),
+                (x1 - nx * halbe_breite_px, y1 - ny * halbe_breite_px),
+                (x0 - nx * halbe_breite_px, y0 - ny * halbe_breite_px),
+            ]
+
+        def _polygon_vorschau_aktualisieren():
+            _polygon_vorschau_entfernen()
+            punkte = auswahl_zustand["polygon_punkte"]
+            if not punkte:
+                canvas.draw_idle()
+                return
+            if len(punkte) == 1:
+                artist, = ax.plot(
+                    [punkte[0][0]], [punkte[0][1]], marker="o", markersize=5,
+                    color="white", zorder=8,
+                )
+            else:
+                artist, = ax.plot(
+                    [p[0] for p in punkte], [p[1] for p in punkte],
+                    color="white", linewidth=1.2, linestyle="--",
+                    marker="o", markersize=4, zorder=8,
+                )
+            auswahl_zustand["vorschau_polygon"] = artist
+            canvas.draw_idle()
+
+        def _polygon_abschliessen():
+            punkte = list(auswahl_zustand["polygon_punkte"])
+            auswahl_zustand["polygon_punkte"] = []
+            _polygon_vorschau_entfernen()
+            if len(punkte) < 3:
+                canvas.draw_idle()
+                return
+            werte = _durchschnitt_im_polygon(punkte)
+            if werte is None:
+                canvas.draw_idle()
+                return
+            markierungen.append({
+                "typ": "polygon", "punkte": punkte,
+                "x": max(p[0] for p in punkte), "y": min(p[1] for p in punkte),
+                "werte": werte,
+            })
+            zeichne()
+
+        # --- Klick = einzelner Pixel, Ziehen = je nach Werkzeug entweder
+        # Zoom (kein Werkzeug aktiv), Rechteck- oder Linien-Auswahl.
+        # Unterschieden wird per Maus-runter/-bewegt/-los statt nur einem
+        # einzelnen Klick-Event, damit ein kurzer Klick weiterhin einen
+        # Punkt setzt, ein Ziehen aber die jeweilige Aktion ausloest. ---
         auswahl = {"aktiv": False, "start_data": None, "start_disp": None, "vorschau": None}
         ZIEH_SCHWELLE_PX = 6  # Mindestbewegung in Bildschirm-Pixeln fuer "Ziehen" statt "Klick"
 
@@ -5802,6 +6021,15 @@ class LaborApp(ctk.CTk):
             if event.inaxes != ax or event.xdata is None or event.ydata is None:
                 return
             canvas.get_tk_widget().focus_set()
+
+            if auswahl_zustand["modus"] == "polygon":
+                if event.dblclick and auswahl_zustand["polygon_punkte"]:
+                    _polygon_abschliessen()
+                    return
+                auswahl_zustand["polygon_punkte"].append((event.xdata, event.ydata))
+                _polygon_vorschau_aktualisieren()
+                return
+
             auswahl["aktiv"] = True
             auswahl["start_data"] = (event.xdata, event.ydata)
             auswahl["start_disp"] = (event.x, event.y)
@@ -5811,11 +6039,20 @@ class LaborApp(ctk.CTk):
                 return
             x0, y0 = auswahl["start_data"]
             _auswahl_vorschau_entfernen()
-            patch = mpatches.Rectangle(
-                (min(x0, event.xdata), min(y0, event.ydata)),
-                abs(event.xdata - x0), abs(event.ydata - y0),
-                fill=False, edgecolor="white", linewidth=1.2, linestyle="--", zorder=8,
-            )
+            if auswahl_zustand["modus"] == "linie":
+                eckpunkte = _linien_eckpunkte(x0, y0, event.xdata, event.ydata)
+                patch = mpatches.Polygon(
+                    eckpunkte, closed=True, fill=False,
+                    edgecolor="white", linewidth=1.2, linestyle="--", zorder=8,
+                )
+            else:
+                # Rechteck-Vorschau - auch fuer den Standard-Zoom-Rahmen
+                # (kein Werkzeug aktiv), damit man den Zielbereich sieht.
+                patch = mpatches.Rectangle(
+                    (min(x0, event.xdata), min(y0, event.ydata)),
+                    abs(event.xdata - x0), abs(event.ydata - y0),
+                    fill=False, edgecolor="white", linewidth=1.2, linestyle="--", zorder=8,
+                )
             ax.add_patch(patch)
             auswahl["vorschau"] = patch
             canvas.draw_idle()
@@ -5831,6 +6068,8 @@ class LaborApp(ctk.CTk):
                 canvas.draw_idle()
                 return
             bewegt_px = ((event.x - start_disp[0]) ** 2 + (event.y - start_disp[1]) ** 2) ** 0.5
+            modus = auswahl_zustand["modus"]
+
             if bewegt_px < ZIEH_SCHWELLE_PX:
                 # Kurzer Klick (kaum Bewegung) -> wie bisher ein einzelner Punkt.
                 x = int(round(event.xdata))
@@ -5843,8 +6082,40 @@ class LaborApp(ctk.CTk):
                     "typ": "punkt", "x": x, "y": y,
                     "werte": {element: wert for element, wert, _farbe in werte},
                 })
+                zeichne()
+                return
+
+            if modus is None:
+                # Kein Auswahlwerkzeug aktiv -> Ziehen zoomt in den
+                # aufgezogenen Bereich (statt eine Markierung zu setzen).
+                x0, y0 = start_data
+                x1, y1 = event.xdata, event.ydata
+                y_aktuell = ax.get_ylim()
+                if y_aktuell[0] > y_aktuell[1]:
+                    ax.set_ylim(max(y0, y1), min(y0, y1))
+                else:
+                    ax.set_ylim(min(y0, y1), max(y0, y1))
+                ax.set_xlim(min(x0, x1), max(x0, x1))
+                canvas.draw_idle()
+                try:
+                    toolbar.push_current()
+                except Exception:
+                    pass
+                return
+
+            if modus == "linie":
+                eckpunkte = _linien_eckpunkte(start_data[0], start_data[1], event.xdata, event.ydata)
+                werte = _durchschnitt_im_polygon(eckpunkte)
+                if werte is None:
+                    canvas.draw_idle()
+                    return
+                markierungen.append({
+                    "typ": "linie", "punkte": eckpunkte,
+                    "x": max(p[0] for p in eckpunkte), "y": min(p[1] for p in eckpunkte),
+                    "werte": werte, "breite_um": auswahl_zustand.get("linienbreite_um", 5.0),
+                })
             else:
-                # Rechteck aufgezogen -> Durchschnitts-Elementaranalyse ueber
+                # Rechteck-Werkzeug -> Durchschnitts-Elementaranalyse ueber
                 # die Auswahl. Box wird an der oberen rechten Ecke verankert.
                 ergebnis = _durchschnitt_im_bereich(start_data[0], start_data[1], event.xdata, event.ydata)
                 if ergebnis is None:
@@ -5861,9 +6132,17 @@ class LaborApp(ctk.CTk):
             zeichne()
 
         def _bei_taste(event):
-            # ESC schliesst die zuletzt gesetzte Markierung (zusaetzlich zum
-            # Mini-"x"-Knopf direkt an der Box).
-            if event.key == "escape" and markierungen:
+            if event.key != "escape":
+                return
+            # ESC bricht zuerst ein begonnenes Polygon ab (falls Punkte
+            # bereits gesetzt sind); erst danach entfernt es (wie bisher)
+            # die zuletzt gesetzte fertige Markierung.
+            if auswahl_zustand["polygon_punkte"]:
+                auswahl_zustand["polygon_punkte"] = []
+                _polygon_vorschau_entfernen()
+                canvas.draw_idle()
+                return
+            if markierungen:
                 markierungen.pop()
                 zeichne()
 
@@ -6053,7 +6332,7 @@ class LaborApp(ctk.CTk):
                     # oben mit eigener Beschriftung.
                     ticks = np.linspace(x_min, x_max, 6)
                     colorbar.set_ticks(ticks)
-                    colorbar.ax.yaxis.set_major_formatter(PercentFormatter())
+                    colorbar.ax.yaxis.set_major_formatter(PercentFormatter(decimals=1))
                     colorbar.ax.tick_params(labelsize=8)
                     farbskala_status["achsen"] = [platzhalter_cax]
                 else:
@@ -6112,7 +6391,7 @@ class LaborApp(ctk.CTk):
                     colorbar.set_label(f"{aktives_element}-Anteil in % – {skalierungs_label}", fontsize=9)
                     ticks = np.linspace(x_min, x_max, 6)
                     colorbar.set_ticks(ticks)
-                    colorbar.ax.yaxis.set_major_formatter(PercentFormatter())
+                    colorbar.ax.yaxis.set_major_formatter(PercentFormatter(decimals=1))
                     colorbar.ax.tick_params(labelsize=8)
 
                     # Oberes Segment: durchgehend die Endfarbe der Colormap
@@ -6156,7 +6435,8 @@ class LaborApp(ctk.CTk):
             # schliesst genau diese eine Markierung wieder (siehe
             # _klick_auf_x_knopf). ---
             for index, marker in enumerate(markierungen, start=1):
-                if marker.get("typ") == "rechteck":
+                marker_typ = marker.get("typ")
+                if marker_typ == "rechteck":
                     rect_patch = mpatches.Rectangle(
                         (marker["x0"], marker["y0"]),
                         marker["x1"] - marker["x0"], marker["y1"] - marker["y0"],
@@ -6167,6 +6447,17 @@ class LaborApp(ctk.CTk):
                         str(index), (marker["x0"], marker["y0"]), color="white", fontsize=9, fontweight="bold",
                         xytext=(3, -3), textcoords="offset points", ha="left", va="top",
                     )
+                elif marker_typ in ("linie", "polygon"):
+                    poly_patch = mpatches.Polygon(
+                        marker["punkte"], closed=True, fill=False,
+                        edgecolor="white", linewidth=1.6, linestyle="--", zorder=5,
+                    )
+                    ax.add_patch(poly_patch)
+                    anker_punkt = marker["punkte"][0]
+                    ax.annotate(
+                        str(index), anker_punkt, color="white", fontsize=9, fontweight="bold",
+                        xytext=(3, -3), textcoords="offset points", ha="left", va="top",
+                    )
                 else:
                     ax.plot(marker["x"], marker["y"], marker="o", markersize=9,
                             markerfacecolor="none", markeredgecolor="white", markeredgewidth=2)
@@ -6175,7 +6466,7 @@ class LaborApp(ctk.CTk):
                         ha="center", va="center",
                     )
                 zeilen, _breite_pts, _hoehe_pts = _markierung_box_inhalt(marker, index)
-                kopf = f"Ø{index}" if marker.get("typ") == "rechteck" else f"M{index}"
+                kopf = f"Ø{index}" if marker_typ in ("rechteck", "linie", "polygon") else f"M{index}"
                 box_text = kopf + "\n" + ("\n".join(zeilen) if zeilen else "alle Elemente ~0 %")
                 ax.annotate(
                     box_text,
@@ -6211,9 +6502,19 @@ class LaborApp(ctk.CTk):
             if vorherige_xlim is not None and vorherige_ylim is not None:
                 ax.set_xlim(vorherige_xlim)
                 ax.set_ylim(vorherige_ylim)
-            self._sem_aktualisiere_massstabsbalken(ax, um_pro_px)
+            # Fuer die interaktive Linien-Werkzeugbreite (Mikrometer -> Pixel)
+            # zwischenspeichern, siehe _linien_eckpunkte weiter unten.
+            kalibrierung_status["um_pro_px"] = um_pro_px
+            # registriere_massstab_auto_update haengt einen xlim/ylim_changed-
+            # Callback ein, der den Balken bei JEDEM Zoom/Pan (Strg+Mausrad,
+            # Toolbar-Lupe, Ziehen-Zoom, ...) automatisch neu berechnet - sonst
+            # bleibt er nur beim vollstaendigen Neuzeichnen korrekt.
+            self._sem_registriere_massstab_auto_update(ax, um_pro_px)
             bild_status["gezeichnet"] = True
-            fig.tight_layout()
+            # Etwas Platz UNTER der Achse reservieren, damit der (bewusst
+            # ausserhalb der Bildflaeche liegende) Maßstabsbalken samt
+            # Beschriftung nicht vom Figure-Rand abgeschnitten wird.
+            fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
             canvas.draw()
             if not kann_zoom_erhalten:
                 # Frischgezeichnetes Bild OHNE uebernommenen Zoom (neuer
@@ -6285,12 +6586,61 @@ class LaborApp(ctk.CTk):
                 "Element unten im Dropdown wählen - die Karte wird über eine "
                 "Farbskala (Colormap) eingefärbt: dunkel/kalt = niedrige, "
                 "hell/warm = hohe Signalintensität. Strg + Mausrad = Diagramm "
-                "zoomen. Lupe in der Toolbar: mit linker Maustaste ein Rechteck "
-                "aufziehen = reinzoomen, mit rechter Maustaste = rauszoomen."
+                "zoomen. Ohne aktives Auswahlwerkzeug: Ziehen mit der Maus "
+                "zoomt in den aufgezogenen Bereich (Doppelklick auf dem "
+                "Scroll-Rad setzt den Zoom zurück)."
             ),
             font=("Arial", 10), text_color=("gray30", "gray70"),
             anchor="w", justify="left", wraplength=220,
         ).pack(fill="x", padx=10, pady=(0, 10))
+
+        # --- Auswahlwerkzeuge: Rechteck / Linie / Polygon fuer die
+        # Durchschnitts-Elementaranalyse ueber einen Bereich (analog zur
+        # bisherigen Rechteck-Auswahl per Ziehen, jetzt aber explizit per
+        # Knopf gewaehlt). OHNE aktives Werkzeug zoomt Ziehen stattdessen
+        # in den aufgezogenen Bereich (siehe _maus_los). ---
+        ctk.CTkLabel(
+            rechte_spalte, text="Auswahlwerkzeug (Ø-Analyse)", font=("Arial", 13, "bold")
+        ).pack(fill="x", padx=10, pady=(0, 3))
+
+        werkzeug_zeile = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+        werkzeug_zeile.pack(fill="x", padx=10, pady=(0, 4))
+
+        rechteck_werkzeug_btn = ctk.CTkButton(
+            werkzeug_zeile, text="▭ Rechteck", width=90, fg_color="transparent", border_width=1,
+        )
+        rechteck_werkzeug_btn.pack(side="left", padx=(0, 4))
+        linie_werkzeug_btn = ctk.CTkButton(
+            werkzeug_zeile, text="／ Linie", width=80, fg_color="transparent", border_width=1,
+        )
+        linie_werkzeug_btn.pack(side="left", padx=(0, 4))
+        polygon_werkzeug_btn = ctk.CTkButton(
+            werkzeug_zeile, text="⬠ Polygon", width=90, fg_color="transparent", border_width=1,
+        )
+        polygon_werkzeug_btn.pack(side="left")
+        rechteck_werkzeug_btn.configure(command=lambda: _setze_werkzeug_modus("rechteck"))
+        linie_werkzeug_btn.configure(command=lambda: _setze_werkzeug_modus("linie"))
+        polygon_werkzeug_btn.configure(command=lambda: _setze_werkzeug_modus("polygon"))
+
+        linienbreite_zeile = ctk.CTkFrame(rechte_spalte, fg_color="transparent")
+        ctk.CTkLabel(linienbreite_zeile, text="Linienbreite (µm):", font=("Arial", 11)).pack(
+            side="left", padx=(0, 6)
+        )
+        linienbreite_entry = ctk.CTkEntry(linienbreite_zeile, width=70)
+        linienbreite_entry.insert(0, "5")
+        linienbreite_entry.pack(side="left")
+
+        ctk.CTkLabel(
+            rechte_spalte,
+            text=(
+                "Rechteck/Linie: Maustaste gedrückt halten und ziehen. "
+                "Polygon: nacheinander Eckpunkte anklicken, Doppelklick "
+                "schließt das Polygon ab. ESC bricht ein begonnenes Polygon "
+                "ab bzw. entfernt die zuletzt gesetzte Markierung."
+            ),
+            font=("Arial", 10), text_color=("gray30", "gray70"),
+            anchor="w", justify="left", wraplength=220,
+        ).pack(fill="x", padx=10, pady=(4, 10))
 
         self._mache_griff_ziehbar(
             griff_rechts, rechte_container, rechte_breite_merker, minimum=180, maximum=500, invertiert=True
@@ -6403,7 +6753,20 @@ class LaborApp(ctk.CTk):
                 return {}
             return {element: float(np.nanmean(karte)) for element, karte in karten.items()}
 
-        def _element_im_dropdown_gewaehlt(gewaehltes_element):
+        def _formatiere_anteil(anteil):
+            """Formatiert einen %-Anteil: 1 Nachkommastelle ab 10 %, sonst
+            2 Nachkommastellen (fuer kleine Anteile praeziser ablesbar)."""
+            if anteil is None:
+                return "–"
+            return f"{anteil:.1f}" if abs(anteil) >= 10 else f"{anteil:.2f}"
+
+        # Bildet die im Dropdown angezeigten Beschriftungen ("Fe (23.4 %)")
+        # auf das eigentliche Elementkuerzel zurueck, da CTkOptionMenu nur
+        # mit den sichtbaren Strings arbeitet.
+        dropdown_label_zu_element = {}
+
+        def _element_im_dropdown_gewaehlt(gewaehltes_label):
+            gewaehltes_element = dropdown_label_zu_element.get(gewaehltes_label, gewaehltes_label)
             zustand["ausgewaehltes_element"] = gewaehltes_element
             self.speichere_diagramm_einstellungen(projekt, methode, zustand)
             _aktualisiere_anteil_label()
@@ -6414,19 +6777,22 @@ class LaborApp(ctk.CTk):
             element = zustand.get("ausgewaehltes_element")
             anteil = haeufigkeiten.get(element) if element else None
             element_anteil_label.configure(
-                text=f"Ø Flächenanteil: {anteil:.1f} %" if anteil is not None else ""
+                text=f"Ø Flächenanteil: {_formatiere_anteil(anteil)} %" if anteil is not None else ""
             )
 
         def _baue_element_zeilen():
             """
             Befuellt das Element-Dropdown mit den Elementen des aktuell
-            geladenen Versuchs (sortiert nach zustand["element_sortierung"])
-            und waehlt das in zustand["ausgewaehltes_element"] hinterlegte
-            Element an (Fallback: haeufigstes bzw. erstes Element - siehe
-            auch der analoge Fallback direkt in zeichne()).
+            geladenen Versuchs (sortiert nach zustand["element_sortierung"]),
+            beschriftet jeden Eintrag zusaetzlich mit seinem durchschnittlichen
+            Flaechenanteil (%) ueber das gesamte Bild (1 Nachkommastelle ab
+            10 %, sonst 2), und waehlt das in zustand["ausgewaehltes_element"]
+            hinterlegte Element an (Fallback: haeufigstes bzw. erstes Element -
+            siehe auch der analoge Fallback direkt in zeichne()).
             """
             alle_elemente = list(zustand.get("element_farben", {}).keys())
             if not alle_elemente:
+                dropdown_label_zu_element.clear()
                 element_dropdown.configure(values=["–"])
                 element_dropdown.set("–")
                 element_anteil_label.configure(text="")
@@ -6442,13 +6808,25 @@ class LaborApp(ctk.CTk):
             else:
                 elemente = sorted(alle_elemente)
 
-            element_dropdown.configure(values=elemente, command=_element_im_dropdown_gewaehlt)
+            dropdown_label_zu_element.clear()
+            labels = []
+            for element in elemente:
+                anteil = haeufigkeiten.get(element)
+                label = f"{element} ({_formatiere_anteil(anteil)} %)" if anteil is not None else element
+                dropdown_label_zu_element[label] = element
+                labels.append(label)
+
+            element_dropdown.configure(values=labels, command=_element_im_dropdown_gewaehlt)
 
             aktuelles_element = zustand.get("ausgewaehltes_element")
             if aktuelles_element not in elemente:
                 aktuelles_element = elemente[0]
                 zustand["ausgewaehltes_element"] = aktuelles_element
-            element_dropdown.set(aktuelles_element)
+            aktuelles_label = next(
+                (l for l, e in dropdown_label_zu_element.items() if e == aktuelles_element),
+                aktuelles_element,
+            )
+            element_dropdown.set(aktuelles_label)
             _aktualisiere_anteil_label()
 
         aktualisiere_element_panel["fn"] = _baue_element_zeilen
@@ -7896,10 +8274,13 @@ class LaborApp(ctk.CTk):
         handles, labels = ax.get_legend_handles_labels()
         if not handles:
             return
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
         position = zustand.get("legende_position", PLOT_LEGENDE_UNTER_ACHSE)
         if position == PLOT_LEGENDE_UNTER_ACHSE:
             ax.legend(
                 handles, labels, loc="upper center", bbox_to_anchor=(0.5, -0.18),
+                bbox_transform=ax.transAxes,
                 ncol=max(1, len(handles)), frameon=False, fontsize=8,
             )
         else:
@@ -8128,7 +8509,10 @@ class LaborApp(ctk.CTk):
             if zustand.get("diagramm_layout") == "vertical":
                 fig.tight_layout(h_pad=4.5, pad=1.5)
             else:
-                fig.tight_layout()
+                if zustand.get("legende_position") == PLOT_LEGENDE_UNTER_ACHSE:
+                    fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
+                else:
+                    fig.tight_layout()
         canvas.draw_idle()
 
     # ------------------------------------------------------------------

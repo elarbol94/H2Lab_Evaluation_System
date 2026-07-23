@@ -468,7 +468,7 @@ METHODEN = ["EMI", "TGA", "SEM"]
 # Jeder direkte Unterordner hier wird als eigenes Projekt zum Zählen der
 # Versuche verwendet (Zuordnung erfolgt per Namens-Abgleich zum Sheet-Tab).
 EXTRA_DATENQUELLEN = [
-    r"C:\Users\marty\Desktop\wetransfer_h2lab_pub_25_9-lime-addition-in-eafd-recycling_2026-07-08_0739",
+    r"C:\Users\marty\Desktop\arbeit",
 ]
 
 class LaborApp(ctk.CTk):
@@ -2316,6 +2316,93 @@ class LaborApp(ctk.CTk):
     # koennen (mehr Platz fuer lange Versuchsnamen bzw. fuer die
     # 2x2-Vorschau in der Mitte).
     # ------------------------------------------------------------------
+    def _mache_markierungsbox_ziehbar(self, canvas, fig, markierungen):
+        """
+        Ermoeglicht das Verschieben EINER Zusammensetzungs-Box (Ø-Analyse-
+        Box, die nach einer Durchschnitts-Elementaranalyse neben der
+        Markierung erscheint) per Drag&Drop mit der Maus - die Markierung
+        (Rechteck/Linie/Polygon/Punkt) selbst bleibt dabei unveraendert an
+        ihrer Stelle, nur die Box (inkl. rotem Pfeil und Mini-"x"-Knopf)
+        wandert mit dem Mauszeiger mit.
+
+        Braucht Referenzen auf die beiden Annotation-Objekte der Box
+        (Text+Pfeil) sowie des "x"-Knopfes, die die aufrufende Stelle beim
+        Zeichnen in marker['_box_ann'] bzw. marker['_knopf_ann'] ablegen
+        muss; marker['box_offset'] (Tupel in Punkten) bestimmt die Position
+        relativ zur Markierung und wird hier live aktualisiert.
+
+        Gibt drei Funktionen zurueck (maus_runter, maus_bewegt, maus_los),
+        die die aufrufende Stelle GANZ VORNE in ihre eigenen
+        button_press_event/motion_notify_event/button_release_event-
+        Handler einbaut. Jede Funktion gibt True zurueck, wenn sie das
+        Event "verbraucht" hat (Box-Drag gestartet/aktiv/beendet) - der
+        Aufrufer darf in diesem Fall KEINE eigene Auswahl beginnen/aendern.
+        """
+        zieh_status = {"aktiv": False, "marker": None, "start_disp": None, "start_offset": None}
+
+        def _box_bbox_display(marker):
+            ann = marker.get("_box_ann")
+            if ann is None:
+                return None
+            try:
+                renderer = fig.canvas.get_renderer()
+                return ann.get_window_extent(renderer)
+            except Exception:
+                return None
+
+        def _treffer_box(event):
+            if event.x is None or event.y is None:
+                return None
+            for marker in markierungen:
+                bbox = _box_bbox_display(marker)
+                if bbox is None:
+                    continue
+                if bbox.x0 <= event.x <= bbox.x1 and bbox.y0 <= event.y <= bbox.y1:
+                    return marker
+            return None
+
+        def maus_runter(event):
+            if event.button != 1:
+                return False
+            marker = _treffer_box(event)
+            if marker is None:
+                return False
+            zieh_status["aktiv"] = True
+            zieh_status["marker"] = marker
+            zieh_status["start_disp"] = (event.x, event.y)
+            zieh_status["start_offset"] = tuple(marker.get("box_offset", (16.0, 16.0)))
+            return True
+
+        def maus_bewegt(event):
+            if not zieh_status["aktiv"] or event.x is None or event.y is None:
+                return False
+            marker = zieh_status["marker"]
+            px_je_pt = fig.dpi / 72.0
+            start_x, start_y = zieh_status["start_disp"]
+            dx_pts = (event.x - start_x) / px_je_pt
+            dy_pts = (event.y - start_y) / px_je_pt
+            basis_x, basis_y = zieh_status["start_offset"]
+            neuer_offset = (basis_x + dx_pts, basis_y + dy_pts)
+            marker["box_offset"] = neuer_offset
+            box_ann = marker.get("_box_ann")
+            knopf_ann = marker.get("_knopf_ann")
+            knopf_delta = marker.get("_knopf_delta_pts", (6.0, -8.0))
+            if box_ann is not None:
+                box_ann.xyann = neuer_offset
+            if knopf_ann is not None:
+                knopf_ann.xyann = (neuer_offset[0] + knopf_delta[0], neuer_offset[1] + knopf_delta[1])
+            canvas.draw_idle()
+            return True
+
+        def maus_los(event):
+            if not zieh_status["aktiv"]:
+                return False
+            zieh_status["aktiv"] = False
+            zieh_status["marker"] = None
+            return True
+
+        return maus_runter, maus_bewegt, maus_los
+
     def _mache_griff_ziehbar(self, griff, ziel_frame, breite_merker, minimum=90, maximum=650, invertiert=False):
         """
         Bindet Maus-Drag-Events an `griff` (eine schmale CTkFrame-Leiste),
@@ -3604,6 +3691,7 @@ class LaborApp(ctk.CTk):
             ax_rechts.set_xticks([])
             ax_rechts.set_yticks([])
             canvas.draw()
+            canvas.get_tk_widget().update_idletasks()
             return
 
         karten_prozent = self._sem_normalisiere_elementkarten(elementkarten)
@@ -3895,6 +3983,22 @@ class LaborApp(ctk.CTk):
             bild_status["gezeichnet"] = True
             _zeichne_markierungen()
             canvas.draw()
+            # WICHTIG: canvas.draw() zeichnet zwar intern neu, der
+            # Tk-Bildschirm wird aber nicht zwingend SOFORT aktualisiert,
+            # wenn zeichne() aus einem Callback AUSSERHALB des Canvas
+            # ausgeloest wurde (z.B. Enter/Uebernehmen im Filter-Panel,
+            # Element-Dropdown) - ohne dieses update_idletasks() blieb das
+            # Bild optisch beim alten Stand, bis man selbst ins Bild klickt.
+            canvas.get_tk_widget().update_idletasks()
+            # Zusaetzlich das gesamte Fenster "idletasks" abarbeiten lassen -
+            # bei Callbacks aus dem Filter-Panel (Entprellung via .after(),
+            # Enter, OptionMenu) reicht update_idletasks() auf dem
+            # Canvas-Widget allein manchmal nicht aus, um den neuen Frame
+            # sofort sichtbar zu machen (abhaengig davon, welches Widget
+            # den Callback ausgeloest hat). self.update_idletasks() ist
+            # guenstiger als self.update() (kein Event-Processing, nur
+            # Geometrie/Redraw) und daher hier unbedenklich.
+            self.update_idletasks()
             # WICHTIG: "Home"-Knopf (Haus-Symbol) der Toolbar reparieren.
             # toolbar.update() ALLEIN reicht nicht - es LEERT nur den
             # Verlaufsspeicher (Zurueck/Vor), setzt aber KEINEN neuen
@@ -4053,8 +4157,9 @@ class LaborApp(ctk.CTk):
             return zeilen, breite_pts, hoehe_pts
 
         def _x_knopf_offset_pts(marker, index):
+            box_x, box_y = marker.get("box_offset", (16.0, 16.0))
             _zeilen, breite_pts, hoehe_pts = _markierung_box_inhalt(marker, index)
-            return (16 + breite_pts - 10, 16 + hoehe_pts - 8)
+            return (box_x + breite_pts - 10, box_y + hoehe_pts - 8)
 
         def _x_knopf_display_pos(marker, index):
             """Aktuelle Bildschirm-Position (Pixel) des Mini-'x'-Knopfes
@@ -4075,6 +4180,12 @@ class LaborApp(ctk.CTk):
                     return marker
             return None
 
+        # --- Ø-Analyse-Box per Drag&Drop verschiebbar machen (Markierung
+        # selbst bleibt an ihrer Stelle) - siehe _mache_markierungsbox_ziehbar. ---
+        _box_maus_runter, _box_maus_bewegt, _box_maus_los = self._mache_markierungsbox_ziehbar(
+            canvas, fig, markierungen
+        )
+
         def _zeichne_markierungen():
             """Zeichnet fuer jede gesetzte Markierung entweder einen kleinen
             nummerierten Kreis am Pixel (einzelner Klick) oder ein
@@ -4088,34 +4199,35 @@ class LaborApp(ctk.CTk):
                     rect_patch = mpatches.Rectangle(
                         (marker["x0"], marker["y0"]),
                         marker["x1"] - marker["x0"], marker["y1"] - marker["y0"],
-                        fill=False, edgecolor="white", linewidth=1.6, linestyle="--", zorder=5,
+                        fill=False, edgecolor="#ff0000", linewidth=1.6, linestyle="--", zorder=5,
                     )
                     ax_ziel.add_patch(rect_patch)
                     ax_ziel.annotate(
-                        str(index), (marker["x0"], marker["y0"]), color="white", fontsize=9, fontweight="bold",
+                        str(index), (marker["x0"], marker["y0"]), color="#ff0000", fontsize=9, fontweight="bold",
                         xytext=(3, -3), textcoords="offset points", ha="left", va="top",
                     )
                 else:
                     ax_ziel.plot(marker["x"], marker["y"], marker="o", markersize=9,
-                                 markerfacecolor="none", markeredgecolor="white", markeredgewidth=2)
+                                 markerfacecolor="none", markeredgecolor="#ff0000", markeredgewidth=2)
                     ax_ziel.annotate(
-                        str(index), (marker["x"], marker["y"]), color="white", fontsize=9, fontweight="bold",
+                        str(index), (marker["x"], marker["y"]), color="#ff0000", fontsize=9, fontweight="bold",
                         ha="center", va="center",
                     )
-                zeilen, _breite_pts, _hoehe_pts = _markierung_box_inhalt(marker, index)
+                zeilen, breite_pts, hoehe_pts = _markierung_box_inhalt(marker, index)
                 kopf = f"Ø{index}" if marker.get("typ") == "rechteck" else f"M{index}"
                 box_text = kopf + "\n" + ("\n".join(zeilen) if zeilen else "keine Elemente > 0 %")
-                ax_ziel.annotate(
+                box_offset = marker.get("box_offset", (16.0, 16.0))
+                box_ann = ax_ziel.annotate(
                     box_text,
                     xy=(marker["x"], marker["y"]), xycoords="data",
-                    xytext=(16, 16), textcoords="offset points",
+                    xytext=box_offset, textcoords="offset points",
                     fontsize=8, color="black", ha="left", va="bottom",
-                    bbox=dict(boxstyle="round,pad=0.35", fc="white", ec=MUL_TURKIS, alpha=0.92),
-                    arrowprops=dict(arrowstyle="->", color=MUL_TURKIS, lw=1.2),
+                    bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#ff0000", alpha=0.92),
+                    arrowprops=dict(arrowstyle="->", color="#ff0000", lw=1.2),
                     zorder=6,
                 )
                 x_knopf_offset = _x_knopf_offset_pts(marker, index)
-                ax_ziel.annotate(
+                knopf_ann = ax_ziel.annotate(
                     "✕",
                     xy=(marker["x"], marker["y"]), xycoords="data",
                     xytext=x_knopf_offset, textcoords="offset points",
@@ -4123,6 +4235,11 @@ class LaborApp(ctk.CTk):
                     bbox=dict(boxstyle="circle,pad=0.22", fc="#c0392b", ec="white", lw=1),
                     zorder=7,
                 )
+                # Referenzen + relativer Knopf-Abstand zur Box fuer das
+                # Box-Drag&Drop merken (siehe _mache_markierungsbox_ziehbar).
+                marker["_box_ann"] = box_ann
+                marker["_knopf_ann"] = knopf_ann
+                marker["_knopf_delta_pts"] = (breite_pts - 10, hoehe_pts - 8)
 
         # --- Klick = einzelner Pixel, Ziehen (Rechteck aufziehen) =
         # Durchschnitts-Elementaranalyse ueber die Auswahl. Unterschieden
@@ -4135,38 +4252,57 @@ class LaborApp(ctk.CTk):
         
         # Maus-basiertes Cluster-Ausblenden: Rechtsklick auf kleine Cluster
         def _rechtsklick_cluster_ausblenden(event):
-            """Rechtsklick auf kleine Cluster entfernt diese automatisch"""
+            """Rechtsklick auf kleine Cluster entfernt diese automatisch.
+            Trifft der Rechtsklick KEINEN entfernbaren kleinen Cluster,
+            wird stattdessen die zuletzt gesetzte Markierung/Auswahl
+            zurueckgenommen (Undo, siehe 'Auswahl zurueck per Rechtsklick")."""
             if event.button != 3:  # Button 3 = Rechtsklick
                 return
-            if event.inaxes not in achsen or event.xdata is None or event.ydata is None:
+            if getattr(toolbar, "mode", ""):
                 return
-            
+            if event.inaxes not in achsen or event.xdata is None or event.ydata is None:
+                if markierungen:
+                    markierungen.pop()
+                    zeichne()
+                return
+
+            def _auswahl_zurueck_falls_moeglich():
+                if markierungen:
+                    markierungen.pop()
+                    zeichne()
+
             # Pixel an dieser Position ermitteln
             karten = aktuelle_daten["karten_normiert"]
             if not karten:
+                _auswahl_zurueck_falls_moeglich()
                 return
             beispiel = next(iter(karten.values()))
             x, y = int(round(event.xdata)), int(round(event.ydata))
             if not (0 <= y < beispiel.shape[0] and 0 <= x < beispiel.shape[1]):
+                _auswahl_zurueck_falls_moeglich()
                 return
             
             # Cluster-Label an dieser Position finden
             maske = zustand.get("_aktuelle_maske")
             if maske is None:
+                _auswahl_zurueck_falls_moeglich()
                 return
             
             labels, anzahl_cluster = self._sem_berechne_cluster(maske)
             if labels is None or anzahl_cluster == 0:
+                _auswahl_zurueck_falls_moeglich()
                 return
             
             cluster_label = labels[y, x]
             if cluster_label == 0:  # Kein Cluster an dieser Position
+                _auswahl_zurueck_falls_moeglich()
                 return
             
             # Größe dieses Clusters prüfen
             groessen = (labels == cluster_label).sum()
             if groessen >= 3:
-                # Nicht klein genug - nicht entfernen
+                # Nicht klein genug - nicht entfernen, stattdessen Auswahl zurueck
+                _auswahl_zurueck_falls_moeglich()
                 return
             
             # KLEINE CLUSTER ENTFERNEN: Maske updaten
@@ -4191,6 +4327,11 @@ class LaborApp(ctk.CTk):
             # zum Zoomen/Verschieben - dann KEINE Markierung setzen/entfernen.
             if getattr(toolbar, "mode", ""):
                 return
+            # Ziehen an einer bestehenden Zusammensetzungs-Box (Drag&Drop)?
+            # Muss VOR allem anderen geprueft werden, siehe
+            # _mache_markierungsbox_ziehbar.
+            if _box_maus_runter(event):
+                return
             # Klick auf den Mini-"x"-Knopf einer bestehenden Box? Das MUSS
             # VOR dem inaxes-Check passieren: die Box (und damit der
             # "x"-Knopf) kann ueber den Bildrand hinaus in den Bereich
@@ -4209,6 +4350,8 @@ class LaborApp(ctk.CTk):
             auswahl["start_disp"] = (event.x, event.y)
 
         def _maus_bewegt(event):
+            if _box_maus_bewegt(event):
+                return
             if not auswahl["aktiv"] or event.inaxes != auswahl["achse"] or event.xdata is None or event.ydata is None:
                 return
             x0, y0 = auswahl["start_data"]
@@ -4223,6 +4366,8 @@ class LaborApp(ctk.CTk):
             canvas.draw_idle()
 
         def _maus_los(event):
+            if _box_maus_los(event):
+                return
             if not auswahl["aktiv"]:
                 return
             auswahl["aktiv"] = False
@@ -4354,10 +4499,50 @@ class LaborApp(ctk.CTk):
                 operator_dropdown.set(eintrag.get("operator", "<"))
                 operator_dropdown.pack(side="left", padx=2)
 
-                wert_entry = ctk.CTkEntry(kopfzeile_filter, width=60)
-                wert_entry.insert(0, str(eintrag.get("wert", 0)))
+                # WICHTIG: Live-Update ueber eine StringVar + trace_add()
+                # statt nur ueber Key-Bindings ("<KeyRelease>"/"<Return>").
+                # CTkEntry.bind() leitet Events zwar an das interne
+                # tkinter.Entry weiter, aber je nach Fokus-/Klick-Reihenfolge
+                # kam es vor, dass ein Tastendruck (insbesondere Enter) NICHT
+                # zuverlaessig ankam und der Wert dadurch "nicht bestaetigt"
+                # wirkte. trace_add("write", ...) auf einer StringVar feuert
+                # dagegen garantiert bei JEDER Aenderung des Textes - egal ob
+                # durch Tippen, Einfuegen oder Enter -, das ist der robuste,
+                # tkinter-native Weg fuer Live-Updates.
+                wert_var = ctk.StringVar(value=str(eintrag.get("wert", 0)))
+                wert_entry = ctk.CTkEntry(kopfzeile_filter, width=60, textvariable=wert_var)
                 wert_entry.pack(side="left", padx=2)
-                wert_entry.bind("<Return>", lambda _e: uebernehmen())
+
+                # Entprellt (150 ms nach der letzten Aenderung), damit nicht
+                # bei JEDEM einzelnen Tastendruck sofort die (rechenintensive)
+                # Cluster-Berechnung neu laeuft - das waere spuerbar rucklig.
+                auto_update_auftrag = {"id": None}
+
+                def _wert_geaendert(*_args, auftrag=auto_update_auftrag):
+                    if auftrag["id"] is not None:
+                        try:
+                            wert_entry.after_cancel(auftrag["id"])
+                        except Exception:
+                            pass
+                    auftrag["id"] = wert_entry.after(150, uebernehmen)
+
+                wert_var.trace_add("write", _wert_geaendert)
+
+                def _sofort_anwenden(_e=None, auftrag=auto_update_auftrag):
+                    # Enter/Fokusverlust: SOFORT anwenden (keine Verzoegerung),
+                    # garantiert der zuletzt getippte Wert wird uebernommen.
+                    if auftrag["id"] is not None:
+                        try:
+                            wert_entry.after_cancel(auftrag["id"])
+                        except Exception:
+                            pass
+                        auftrag["id"] = None
+                    uebernehmen()
+                    return "break"
+
+                wert_entry.bind("<Return>", _sofort_anwenden)
+                wert_entry.bind("<KP_Enter>", _sofort_anwenden)
+                wert_entry.bind("<FocusOut>", _sofort_anwenden)
                 ctk.CTkLabel(kopfzeile_filter, text="%", font=("Arial", 11)).pack(side="left", padx=(0, 4))
 
                 def _entfernen(i=index):
@@ -5860,8 +6045,9 @@ class LaborApp(ctk.CTk):
             return zeilen, breite_pts, hoehe_pts
 
         def _x_knopf_offset_pts(marker, index):
+            box_x, box_y = marker.get("box_offset", (16.0, 16.0))
             _zeilen, breite_pts, hoehe_pts = _markierung_box_inhalt(marker, index)
-            return (16 + breite_pts - 10, 16 + hoehe_pts - 8)
+            return (box_x + breite_pts - 10, box_y + hoehe_pts - 8)
 
         def _x_knopf_display_pos(marker, index):
             """Aktuelle Bildschirm-Position (Pixel) des Mini-'x'-Knopfes
@@ -5879,6 +6065,12 @@ class LaborApp(ctk.CTk):
                 if (event.x - bx) ** 2 + (event.y - by) ** 2 <= 11 ** 2:
                     return marker
             return None
+
+        # --- Ø-Analyse-Box per Drag&Drop verschiebbar machen (Markierung
+        # selbst bleibt an ihrer Stelle) - siehe _mache_markierungsbox_ziehbar. ---
+        _box_maus_runter, _box_maus_bewegt, _box_maus_los = self._mache_markierungsbox_ziehbar(
+            canvas, fig, markierungen
+        )
 
         # --- Auswahlwerkzeuge: "rechteck"/"linie"/"polygon" (per Knopf im
         # rechten Panel gewaehlt) oder None (Standard). OHNE aktives
@@ -6002,12 +6194,29 @@ class LaborApp(ctk.CTk):
                     pass
                 auswahl["vorschau"] = None
 
+        def _rechtsklick_auswahl_zurueck(event):
+            """Rechtsklick nimmt die zuletzt gesetzte Markierung/Auswahl
+            zurueck (identisch zu ESC) - solange nicht gerade eine Box
+            gezogen wird oder die Toolbar-Lupe/Pan aktiv ist."""
+            if event.button != 3:
+                return
+            if getattr(toolbar, "mode", ""):
+                return
+            if markierungen:
+                markierungen.pop()
+                zeichne()
+
         def _maus_runter(event):
             if event.button != 1:
                 return
             # Waehrend die Toolbar-Lupe/Pan aktiv ist, gehoert der Klick/Zug
             # zum Zoomen/Verschieben - dann KEINE Markierung setzen/entfernen.
             if getattr(toolbar, "mode", ""):
+                return
+            # Ziehen an einer bestehenden Zusammensetzungs-Box (Drag&Drop)?
+            # Muss VOR allem anderen geprueft werden, siehe
+            # _mache_markierungsbox_ziehbar.
+            if _box_maus_runter(event):
                 return
             # Klick auf den Mini-"x"-Knopf einer bestehenden Box? Das MUSS
             # VOR dem inaxes-Check passieren: die Box (und damit der
@@ -6035,6 +6244,8 @@ class LaborApp(ctk.CTk):
             auswahl["start_disp"] = (event.x, event.y)
 
         def _maus_bewegt_auswahl(event):
+            if _box_maus_bewegt(event):
+                return
             if not auswahl["aktiv"] or event.inaxes != ax or event.xdata is None or event.ydata is None:
                 return
             x0, y0 = auswahl["start_data"]
@@ -6043,7 +6254,7 @@ class LaborApp(ctk.CTk):
                 eckpunkte = _linien_eckpunkte(x0, y0, event.xdata, event.ydata)
                 patch = mpatches.Polygon(
                     eckpunkte, closed=True, fill=False,
-                    edgecolor="white", linewidth=1.2, linestyle="--", zorder=8,
+                    edgecolor="#ff0000", linewidth=1.2, linestyle="--", zorder=8,
                 )
             else:
                 # Rechteck-Vorschau - auch fuer den Standard-Zoom-Rahmen
@@ -6051,13 +6262,15 @@ class LaborApp(ctk.CTk):
                 patch = mpatches.Rectangle(
                     (min(x0, event.xdata), min(y0, event.ydata)),
                     abs(event.xdata - x0), abs(event.ydata - y0),
-                    fill=False, edgecolor="white", linewidth=1.2, linestyle="--", zorder=8,
+                    fill=False, edgecolor="#ff0000", linewidth=1.2, linestyle="--", zorder=8,
                 )
             ax.add_patch(patch)
             auswahl["vorschau"] = patch
             canvas.draw_idle()
 
         def _maus_los(event):
+            if _box_maus_los(event):
+                return
             if not auswahl["aktiv"]:
                 return
             auswahl["aktiv"] = False
@@ -6149,6 +6362,7 @@ class LaborApp(ctk.CTk):
         canvas.mpl_connect("motion_notify_event", _bei_maus_bewegung)
         canvas.mpl_connect("axes_leave_event", _bei_maus_verlassen)
         canvas.mpl_connect("button_press_event", _maus_runter)
+        canvas.mpl_connect("button_press_event", _rechtsklick_auswahl_zurueck)
         canvas.mpl_connect("motion_notify_event", _maus_bewegt_auswahl)
         canvas.mpl_connect("button_release_event", _maus_los)
         canvas.mpl_connect("key_press_event", _bei_taste)
@@ -6211,6 +6425,7 @@ class LaborApp(ctk.CTk):
                 aktuelle_daten["karten_normiert"] = None
                 bild_status["gezeichnet"] = False
                 canvas.draw()
+                canvas.get_tk_widget().update_idletasks()
                 return
             elementkarten, eds_pfad = self._sem_lade_elementkarten(pfad)
             if not elementkarten:
@@ -6440,45 +6655,46 @@ class LaborApp(ctk.CTk):
                     rect_patch = mpatches.Rectangle(
                         (marker["x0"], marker["y0"]),
                         marker["x1"] - marker["x0"], marker["y1"] - marker["y0"],
-                        fill=False, edgecolor="white", linewidth=1.6, linestyle="--", zorder=5,
+                        fill=False, edgecolor="#ff0000", linewidth=1.6, linestyle="--", zorder=5,
                     )
                     ax.add_patch(rect_patch)
                     ax.annotate(
-                        str(index), (marker["x0"], marker["y0"]), color="white", fontsize=9, fontweight="bold",
+                        str(index), (marker["x0"], marker["y0"]), color="#ff0000", fontsize=9, fontweight="bold",
                         xytext=(3, -3), textcoords="offset points", ha="left", va="top",
                     )
                 elif marker_typ in ("linie", "polygon"):
                     poly_patch = mpatches.Polygon(
                         marker["punkte"], closed=True, fill=False,
-                        edgecolor="white", linewidth=1.6, linestyle="--", zorder=5,
+                        edgecolor="#ff0000", linewidth=1.6, linestyle="--", zorder=5,
                     )
                     ax.add_patch(poly_patch)
                     anker_punkt = marker["punkte"][0]
                     ax.annotate(
-                        str(index), anker_punkt, color="white", fontsize=9, fontweight="bold",
+                        str(index), anker_punkt, color="#ff0000", fontsize=9, fontweight="bold",
                         xytext=(3, -3), textcoords="offset points", ha="left", va="top",
                     )
                 else:
                     ax.plot(marker["x"], marker["y"], marker="o", markersize=9,
-                            markerfacecolor="none", markeredgecolor="white", markeredgewidth=2)
+                            markerfacecolor="none", markeredgecolor="#ff0000", markeredgewidth=2)
                     ax.annotate(
-                        str(index), (marker["x"], marker["y"]), color="white", fontsize=9, fontweight="bold",
+                        str(index), (marker["x"], marker["y"]), color="#ff0000", fontsize=9, fontweight="bold",
                         ha="center", va="center",
                     )
-                zeilen, _breite_pts, _hoehe_pts = _markierung_box_inhalt(marker, index)
+                zeilen, breite_pts, hoehe_pts = _markierung_box_inhalt(marker, index)
                 kopf = f"Ø{index}" if marker_typ in ("rechteck", "linie", "polygon") else f"M{index}"
                 box_text = kopf + "\n" + ("\n".join(zeilen) if zeilen else "alle Elemente ~0 %")
-                ax.annotate(
+                box_offset = marker.get("box_offset", (16.0, 16.0))
+                box_ann = ax.annotate(
                     box_text,
                     xy=(marker["x"], marker["y"]), xycoords="data",
-                    xytext=(16, 16), textcoords="offset points",
+                    xytext=box_offset, textcoords="offset points",
                     fontsize=8, color="black", ha="left", va="bottom",
-                    bbox=dict(boxstyle="round,pad=0.35", fc="white", ec=MUL_TURKIS, alpha=0.92),
-                    arrowprops=dict(arrowstyle="->", color=MUL_TURKIS, lw=1.2),
+                    bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#ff0000", alpha=0.92),
+                    arrowprops=dict(arrowstyle="->", color="#ff0000", lw=1.2),
                     zorder=6,
                 )
                 x_knopf_offset = _x_knopf_offset_pts(marker, index)
-                ax.annotate(
+                knopf_ann = ax.annotate(
                     "✕",
                     xy=(marker["x"], marker["y"]), xycoords="data",
                     xytext=x_knopf_offset, textcoords="offset points",
@@ -6486,6 +6702,11 @@ class LaborApp(ctk.CTk):
                     bbox=dict(boxstyle="circle,pad=0.22", fc="#c0392b", ec="white", lw=1),
                     zorder=7,
                 )
+                # Referenzen + relativer Knopf-Abstand zur Box fuer das
+                # Box-Drag&Drop merken (siehe _mache_markierungsbox_ziehbar).
+                marker["_box_ann"] = box_ann
+                marker["_knopf_ann"] = knopf_ann
+                marker["_knopf_delta_pts"] = (breite_pts - 10, hoehe_pts - 8)
 
             # --- Massstabsbalken in Mikrometer: bevorzugt automatisch aus
             # der H5OINA-Datei des Versuchsordners gelesen, sonst Fallback
@@ -6516,6 +6737,11 @@ class LaborApp(ctk.CTk):
             # Beschriftung nicht vom Figure-Rand abgeschnitten wird.
             fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
             canvas.draw()
+            # Siehe Rohdaten-Tab: erzwingt die sofortige Bildschirm-
+            # Aktualisierung, auch wenn zeichne() aus einem Callback
+            # ausserhalb des Canvas ausgeloest wurde (Element-Dropdown,
+            # Plot-Settings-Dialog, ...).
+            canvas.get_tk_widget().update_idletasks()
             if not kann_zoom_erhalten:
                 # Frischgezeichnetes Bild OHNE uebernommenen Zoom (neuer
                 # Versuch bzw. allererstes Zeichnen) = die tatsaechliche
